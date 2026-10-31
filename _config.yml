@@ -1,0 +1,8 @@
+# Pages should only publish the README and the scope PDFs, so every code folder goes here.
+# Jekyll 3 replaces its default exclude list with this one, so the defaults are listed again.
+exclude:
+  - tool/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/
