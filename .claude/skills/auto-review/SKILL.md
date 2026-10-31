@@ -1,17 +1,17 @@
 ---
 name: auto-review
-description: Review a PR in this repo with nobody watching and stage the findings as a PENDING review that only Samuel can see. Runs /code-review at xhigh, a design agent, the repo's checks and a test coverage pass, then posts every finding as a pending inline comment. It never asks a question, so a cloud task, a GitHub Action or a scheduled run can start it. Use when asked to "auto review PR N", or when a trigger passes a PR number.
+description: Review a PR in this repo with nobody watching and publish the findings as one COMMENT review. Runs /code-review at xhigh, a design agent, the repo's checks and a test coverage pass, then posts every finding as an inline comment. The auto review GitHub Action runs it on each PR, where it posts as claude[bot]. It never asks a question. Use when asked to "auto review PR N", or when a trigger passes a PR number.
 argument-hint: <PR number> [--effort=low|medium|high|xhigh|max]
 allowed-tools: Bash Read Grep Glob Write Skill Agent
 ---
 
-Review one PR and leave the findings as a **pending** review on GitHub. Nobody else can see a pending review. Samuel reads it, deletes what he disagrees with and submits the rest himself. Never submit it.
+Review one PR and publish the findings as one review on GitHub, with `event: "COMMENT"`. In the `auto-review` workflow, `gh` runs as the Claude GitHub App, so the review shows up as `claude[bot]`. Run by hand, it posts as whoever `gh` is logged in as. It never approves and never requests changes. Samuel resolves the threads he disagrees with.
 
 This skill runs unattended. Never ask a question and never wait for an answer. When something blocks the run, stop and say why in the report.
 
 ## Ground rules
 
-- Use only `gh api` REST calls and `git`. Never `gh pr`, `gh issue`, `gh repo view` or `gh api graphql`. Claude's cloud sessions reach GitHub through a proxy that blocks GraphQL, and all of those use it.
+- Use only `gh api` REST calls and `git`. Never `gh pr`, `gh issue`, `gh repo view` or `gh api graphql`. All of those use GraphQL, which a Claude cloud session can't reach. REST works in the Action, on a laptop and in the cloud alike.
 - Work in a scratch folder, `RUN=$(mktemp -d)`. Leave the checkout the session started in alone, apart from `git fetch`.
 - Get the repo from the remote:
 
@@ -34,15 +34,15 @@ gh api repos/$REPO/pulls/$N --jq '{state, merged, title, body, html_url, head_sh
 
 Stop when it's closed or merged. Read the base from `base`. Never assume `development` or `main`.
 
-Check who `gh` acts as with `gh api user --jq .login`. A login that ends in `[bot]` would own a review Samuel can never see, so stop. If the call is refused, carry on. Cloud sessions only allow repo endpoints.
+## Step 2: Check for an earlier run
 
-## Step 2: Check for a pending review
+Every review this skill posts opens with the marker `<!-- auto-review -->`. Look for one on the same head commit:
 
 ```
-gh api repos/$REPO/pulls/$N/reviews --jq '.[] | select(.state=="PENDING") | .id'
+gh api repos/$REPO/pulls/$N/reviews --paginate --jq ".[] | select(.commit_id == \"$HEAD_SHA\") | select((.body // \"\") | contains(\"<!-- auto-review -->\")) | .html_url"
 ```
 
-GitHub allows one pending review per person per PR. If one exists, stop and report its id. It may hold comments Samuel wrote by hand, and deleted pending comments can't be recovered. This check comes before any analysis, so a blocked run costs nothing.
+If one exists, stop and report its link. A second review of the same commit only repeats the first. This check comes before any analysis, so a blocked run costs nothing.
 
 ## Step 3: Get the diff and the code
 
@@ -111,7 +111,7 @@ Only failing tests run again in `$RUN/base`, so an old failure isn't blamed on t
 
 Invoke it with the **Skill** tool: `skill: "code-review"`, `args: "<effort> <N>"`. Always pass the PR number. Without it, `/code-review` reviews the local working tree instead. Never pass `--comment` or `--fix`, and never use `ultra`. If it can't load the PR, try once more with `origin/<head>` as the target. If that fails too, say so in the report and carry on.
 
-Pass every finding through. Don't drop any for being small or unsure. Samuel is the filter, and deleting a pending comment takes one click. Only three things change on the way:
+Pass every finding through. Don't drop any for being small or unsure. Samuel is the filter, and resolving a thread takes one click. Only three things change on the way:
 
 - **Merge duplicates** with the coverage pass and the agents. One comment per point.
 - **Rewrite the wording** to the rules in "Writing the comments". Keep the claim, the file and the line.
@@ -177,18 +177,19 @@ Never invent a function name to build an example. Write the failure in prose ins
 
 **Suggestion blocks** only when the fix is exact and at most about 5 lines. The block holds the full replacement for the lines the comment covers.
 
-**The repo is public.** Never cite a home directory path, a scratch file or anything outside the repo. A comment becomes public once Samuel submits it.
+**The repo is public.** Every comment is public the moment the review posts. Never cite a home directory path, a runner path, a scratch file or anything outside the repo.
 
-## Step 9: Post the pending review
+## Step 9: Post the review
 
-Zero comments and nothing for the body means no review. Skip to the report.
+Always post, even with zero comments. Then the body says nothing was found and lists the checks, so the PR shows the run happened.
 
 Write the payload to `$RUN/review.json` and read it back before sending, so a broken code fence shows up here:
 
 ```json
 {
   "commit_id": "<head sha>",
-  "body": "<label counts, the Issue coverage lines, and a split if the design agent asked for one>",
+  "event": "COMMENT",
+  "body": "<!-- auto-review -->\n<label counts, the checks, the Issue coverage lines, and a split if the design agent asked for one>",
   "comments": [
     {"path": "src/lesstests/foo.py", "line": 42, "side": "RIGHT", "body": "**High**\n\n..."},
     {"path": "src/lesstests/bar.py", "start_line": 10, "start_side": "RIGHT", "line": 14, "side": "RIGHT", "body": "**Low**\n\n..."}
@@ -197,21 +198,15 @@ Write the payload to `$RUN/review.json` and read it back before sending, so a br
 ```
 
 - `line` is the line number in the new file. A comment on a deleted line uses `side: "LEFT"` and the old line number.
-- Never add an `event` field. Leaving it out is what keeps the review pending.
+- `event` is always `COMMENT`. Never `APPROVE` and never `REQUEST_CHANGES`. Whether the PR is good to merge is Samuel's call.
 
 ```
-gh api -X POST repos/$REPO/pulls/$N/reviews --input $RUN/review.json
+gh api -X POST repos/$REPO/pulls/$N/reviews --input $RUN/review.json --jq '{state, user: .user.login, html_url}'
 ```
 
-GitHub rejects the whole call when one comment points at a line outside the diff. Fix that comment and send the full set again. Never drop comments to get it through.
+GitHub rejects the whole call when one comment points at a line outside the diff, and then nothing is posted. Fix that comment and send the full set again. Never drop comments to get it through. Run by hand, the call also fails when Samuel has a pending review open on the PR. Stop and say so then.
 
-Then check it stayed pending:
-
-```
-gh api repos/$REPO/pulls/$N/reviews --jq '.[] | select(.state=="PENDING") | {id, user: .user.login}'
-```
-
-Any other state means it got submitted by accident. Say so at the top of the report.
+The reply should show `COMMENTED`. Anything else goes at the top of the report.
 
 ## Step 10: Clean up and report
 
@@ -219,18 +214,19 @@ Remove both worktrees with `git worktree remove --force $RUN/head` and `git work
 
 Then report, short:
 
-- The PR link, and its `/files` link where the review waits.
+- The PR link and the review link.
 - The effort used and the comment count per label.
 - The issue coverage tally, or that no issue was linked.
 - Each check as passed, failed, failing on base too, or unfinished. How many breaks became verified comments.
 - The design verdict, and any concern that had no line.
 - Anything that blocked or failed, like `/code-review` not loading the PR.
-- That the review is pending, or why no review was posted.
+- That the review was posted and who it shows as, or why it wasn't.
 
 ## Hard rules
 
-- Never submit the review. No `event` field and no `gh pr review`.
-- Never delete, replace or add to an existing pending review.
+- Only ever post with `event: "COMMENT"`. Never approve and never request changes.
+- Never post a second review on a head commit that already has one.
+- Never edit, dismiss or delete any review or comment, Claude's or anyone else's.
 - Never ask a question or wait for input.
 - Never use GraphQL, `gh pr` or `gh issue`.
 - Never let an agent post, push, commit or edit outside `$RUN`.
