@@ -86,7 +86,7 @@ class SelectionStudy:
         matrix = CoverageMatrix(self._coverage, requests, pool)
         suites: list[SmallerSuite] = []
         for budget in self._budgets:
-            size = budget.size(len(records))
+            size = budget.size(len(pool))
             suites.append(self._build(CoverageSelector(), matrix, budget, 0, size, requests, out))
             for draw in range(1, self._draws + 1):
                 selector = RandomSelector(RandomSelector.seed_for(self._seed, budget, draw))
