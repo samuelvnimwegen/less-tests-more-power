@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from lesstests.java import JavaSuite, JavaTest, JvmRunner, Outcome
 
 SOURCE = """package generations.single_agent;
@@ -67,3 +69,25 @@ def test_outcome_comes_from_the_matching_method(tmp_path: Path) -> None:
     assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "other")) is Outcome.PASSED
     assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "setUp")) is Outcome.ERROR
     assert JvmRunner._read_outcome(tmp_path / "missing.xml", JavaTest("a.B", "c")) is Outcome.ERROR
+
+def _report_with(tmp_path: Path, *statuses: str) -> Path:
+    entries = "".join(f'<test-method status="{status}" name="addPet"/>' for status in statuses)
+    report = tmp_path / "testng-results.xml"
+    report.write_text(f'<testng-results><class name="s.Pet">{entries}</class></testng-results>')
+    return report
+
+
+@pytest.mark.parametrize(
+    ("statuses", "outcome"),
+    [
+        (("PASS", "FAIL", "PASS"), Outcome.FAILED),
+        (("SKIP", "PASS"), Outcome.SKIPPED),
+        (("PASS", "PASS"), Outcome.PASSED),
+        (("PASS", "WEIRD"), Outcome.ERROR),
+    ],
+)
+def test_a_test_that_ran_more_than_once_gets_its_worst_run(
+    tmp_path: Path, statuses: tuple[str, ...], outcome: Outcome
+) -> None:
+    assert JvmRunner._read_outcome(_report_with(tmp_path, *statuses), JavaTest("s.Pet", "addPet")) is outcome
+

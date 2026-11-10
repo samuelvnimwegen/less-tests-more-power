@@ -131,6 +131,7 @@ class JvmRunner:
     """Runs one TestNG test at a time in a fresh JVM, from the project folder so relative paths in tests resolve."""
 
     _STATUS = {"PASS": Outcome.PASSED, "FAIL": Outcome.FAILED, "SKIP": Outcome.SKIPPED}
+    _WORST_FIRST = (Outcome.FAILED, Outcome.ERROR, Outcome.SKIPPED, Outcome.PASSED)
 
     def __init__(self, project: MavenProject, output: Path, timeout: float = 300.0) -> None:
         """Keep the project and the folder for TestNG's reports and console logs."""
@@ -166,12 +167,18 @@ class JvmRunner:
 
     @classmethod
     def _read_outcome(cls, report: Path, test: JavaTest) -> Outcome:
+        """Read the outcome of a test. A test that ran more than once gets its worst run, so a retry counts as skipped.
+
+        Returns:
+            The worst outcome, or an error when the report or the test is missing.
+        """
         if not report.exists():
             return Outcome.ERROR
-        for class_node in ET.parse(report).iter("class"):
-            if class_node.get("name") != test.class_name:
-                continue
-            for method in class_node.iter("test-method"):
-                if method.get("name") == test.method and method.get("is-config") != "true":
-                    return cls._STATUS.get(method.get("status", ""), Outcome.ERROR)
-        return Outcome.ERROR
+        found = {
+            cls._STATUS.get(method.get("status", ""), Outcome.ERROR)
+            for class_node in ET.parse(report).iter("class")
+            if class_node.get("name") == test.class_name
+            for method in class_node.iter("test-method")
+            if method.get("name") == test.method and method.get("is-config") != "true"
+        }
+        return next((outcome for outcome in cls._WORST_FIRST if outcome in found), Outcome.ERROR)
