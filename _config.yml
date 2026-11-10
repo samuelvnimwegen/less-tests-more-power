@@ -3,6 +3,8 @@
 exclude:
   - src/
   - tests/
+  - pyproject.toml
+  - uv.lock
   - Gemfile
   - Gemfile.lock
   - node_modules/
