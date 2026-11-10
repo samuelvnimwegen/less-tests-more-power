@@ -87,7 +87,6 @@ def test_check_fails_when_counts_differ() -> None:
 def test_coverage_set_counts_and_differences() -> None:
     a = CoverageSet([CoverageItem(Criterion.PATH, "/a"), CoverageItem(Criterion.STATUS, "GET /a 200")])
     b = CoverageSet([CoverageItem(Criterion.PATH, "/a")])
-    assert len(a | b) == 2
     assert (a - b).counts()["status"] == 1
     assert CoverageSet.union([a, b]) == a
     assert CoverageSet.from_list(a.to_list()) == a

@@ -59,14 +59,6 @@ class CoverageSet:
         """Keep the items."""
         self.items = frozenset(items)
 
-    def __or__(self, other: "CoverageSet") -> "CoverageSet":
-        """Join two sets.
-
-        Returns:
-            The items in either set.
-        """
-        return CoverageSet(self.items | other.items)
-
     def __sub__(self, other: "CoverageSet") -> "CoverageSet":
         """Remove the items of another set.
 
@@ -166,16 +158,6 @@ class RestCovReport:
     def metrics(self) -> dict[str, Any]:
         """RESTCov's own metrics."""
         return self._raw["metrics"]
-
-    @property
-    def matched_requests(self) -> int:
-        """The requests RESTCov matched to a documented operation."""
-        return int(self.metrics["total_requests"])
-
-    @property
-    def unmatched(self) -> list[dict[str, str]]:
-        """Up to 30 requests RESTCov could not match to the description."""
-        return self._raw.get("unmatched_samples", [])
 
     def totals(self) -> dict[str, int]:
         """Count the documented items of every criterion.
