@@ -109,3 +109,10 @@ def test_real_restcov_example_matches_its_own_metrics(tmp_path: Path) -> None:
     example = script.parent / "examples" / "petstore"
     report = RestCov(script, example / "openapi.json").measure(example / "logs", tmp_path)
     assert report.items().count(Criterion.OPERATION) == report.metrics["covered_ops"]
+
+
+def test_restcov_output_that_is_not_text_still_gives_its_error(tmp_path: Path) -> None:
+    script = tmp_path / "restcov.py"
+    script.write_text("import sys\nsys.stderr.buffer.write(b'bad \\xff\\xfe byte')\nsys.exit(1)\n")
+    with pytest.raises(RuntimeError, match="bad"):
+        RestCov(script, tmp_path / "spec.json").measure(tmp_path / "logs", tmp_path / "out")

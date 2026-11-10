@@ -98,7 +98,7 @@ class MavenProject:
         shutil.copy2(self.source / "pom.xml", self.workdir / "pom.xml")
         shutil.copytree(self.source / "src", self.workdir / "src")
         command = ["mvn", "-q", "-B", "test-compile", "dependency:build-classpath", "-Dmdep.outputFile=classpath.txt"]
-        result = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:
             raise RuntimeError(f"Maven failed in {self.workdir}:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
 
@@ -152,7 +152,12 @@ class JvmRunner:
         started = time.monotonic()
         try:
             result = subprocess.run(
-                command, cwd=self._project.workdir, capture_output=True, text=True, timeout=self._timeout
+                command,
+                cwd=self._project.workdir,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=self._timeout,
             )
             (reports / "console.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         except subprocess.TimeoutExpired:

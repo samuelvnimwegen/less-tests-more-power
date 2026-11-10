@@ -274,7 +274,7 @@ class RestCov:
             "--out",
             str(out),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:
             raise RuntimeError(f"RESTCov failed on {logs}:\n{result.stderr[-4000:]}")
         report = RestCovReport.read(out / "coverage.json")
