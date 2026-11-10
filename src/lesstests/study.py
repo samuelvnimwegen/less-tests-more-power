@@ -65,7 +65,14 @@ class SelectionStudy:
         seed: int,
         passing_only: bool = False,
     ) -> None:
-        """Set up the study. With `passing_only`, both selectors pick only from tests that passed alone."""
+        """Set up the study. With `passing_only`, both selectors pick only from tests that passed alone.
+
+        Raises:
+            ValueError: If two budgets share a label, since they would write to the same folders.
+        """
+        labels = [budget.label for budget in budgets]
+        if len(set(labels)) != len(labels):
+            raise ValueError(f"Every budget needs its own label, got {', '.join(labels)}")
         self._recording = recording
         self._coverage = coverage
         self._restcov = restcov
@@ -173,7 +180,7 @@ class StudyReport:
             versions = [version for version in self._result["versions"] if version["budget"] == budget]
             selected = next(version for version in versions if version["version"] == "selected")
             drawn = [version for version in versions if version["version"] == "random"]
-            label = f"{round(budget * 100)}%"
+            label = Budget(budget).label
             lost = [str(selected["lost"][key]) for key in keys] + [str(selected["requests"])]
             lines.append(f"| {label} | {selected['kept']} | Selected | " + " | ".join(lost) + " |")
             if drawn:

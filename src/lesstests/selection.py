@@ -17,18 +17,28 @@ class Budget:
 
     share: float
 
+    def __post_init__(self) -> None:
+        """Check the share.
+
+        Raises:
+            ValueError: If the share is not above 0 and at most 1. This also catches nan and inf.
+        """
+        if not 0 < self.share <= 1:
+            raise ValueError(f"A budget keeps more than 0% and at most 100% of the tests, not {self.share * 100}%")
+
     def size(self, tests: int) -> int:
         """Turn the share into a number of tests, rounding halves up and keeping at least one.
 
         Returns:
             The number of tests to keep.
         """
-        return max(1, math.floor(self.share * tests + 0.5))
+        # Float maths can leave an exact half just under .5, like 0.29 * 50 = 14.499999999999998.
+        return max(1, math.floor(round(self.share * tests, 9) + 0.5))
 
     @property
     def label(self) -> str:
-        """The share as a percentage, like `75%`."""
-        return f"{round(self.share * 100)}%"
+        """The share as a percentage, like `75%` or `12.5%`."""
+        return f"{self.share * 100:g}%"
 
 
 class CoverageMatrix:

@@ -18,9 +18,34 @@ def _matrix(reaches: dict[str, set[str]], requests: dict[str, int]) -> CoverageM
     return CoverageMatrix(coverage, {_test(name): count for name, count in requests.items()}, list(per_test))
 
 
-@pytest.mark.parametrize(("share", "tests", "size"), [(0.75, 108, 81), (0.5, 161, 81), (0.25, 161, 40), (0.01, 10, 1)])
+@pytest.mark.parametrize(
+    ("share", "tests", "size"),
+    [
+        (0.75, 108, 81),
+        (0.5, 161, 81),
+        (0.25, 161, 40),
+        (0.01, 10, 1),
+        (29 / 100, 50, 15),
+        (35 / 100, 90, 32),
+        (1.4 / 100, 250, 4),
+        (33.3 / 100, 500, 167),
+    ],
+)
 def test_budget_rounds_halves_up_and_keeps_one(share: float, tests: int, size: int) -> None:
     assert Budget(share).size(tests) == size
+
+
+@pytest.mark.parametrize("share", [0.0, -0.5, 1.5, float("nan"), float("inf")])
+def test_budget_outside_0_to_100_percent_is_refused(share: float) -> None:
+    with pytest.raises(ValueError, match="budget"):
+        Budget(share)
+
+
+@pytest.mark.parametrize(
+    ("share", "label"), [(0.125, "12.5%"), (0.12, "12%"), (0.75, "75%"), (29 / 100, "29%"), (1.0, "100%")]
+)
+def test_budget_label_keeps_its_decimals(share: float, label: str) -> None:
+    assert Budget(share).label == label
 
 
 def test_selector_keeps_the_most_items() -> None:

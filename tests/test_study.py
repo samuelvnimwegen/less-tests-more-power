@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from fake_restcov import FakeRestCov
 
 from lesstests.coverage import CoverageItem, CoverageSet, Criterion, SuiteCoverage
@@ -58,3 +59,10 @@ def test_passing_only_sizes_budgets_from_the_pool(tmp_path: Path) -> None:
     suites = study.run(tmp_path / "selection")
     assert [len(suite.tests) for suite in suites] == [1, 1, 1]
     assert all(test.method.startswith("p") for suite in suites for test in suite.tests)
+
+
+def test_budgets_that_share_a_label_are_refused(tmp_path: Path) -> None:
+    recording = Recording(tmp_path / "rec")
+    coverage = SuiteCoverage({}, CoverageSet(), {})
+    with pytest.raises(ValueError, match="label"):
+        SelectionStudy(recording, coverage, FakeRestCov(), [Budget(0.5), Budget(0.5)], draws=1, seed=1)
