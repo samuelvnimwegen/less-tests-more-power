@@ -39,13 +39,19 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
             self.send_error(502, "Upstream service unreachable")
             return
         self._proxy.log.add(Exchange(request, response))
-        self.send_response(response.status, response.reason)
+
+        # The plain send_response adds its own Server and Date, which would double the upstream ones.
+        self.send_response_only(response.status, response.reason)
+        if self.command == "HEAD":
+            for key, value in response.headers.without(*HOP_BY_HOP).pairs:
+                self.send_header(key, value)
+            self.end_headers()
+            return
         for key, value in response.headers.without(*HOP_BY_HOP, "content-length").pairs:
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(response.body.data)))
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(response.body.data)
+        self.wfile.write(response.body.data)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _forward  # noqa: N815
 
@@ -60,10 +66,15 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
         while True:
             size = int(self.rfile.readline().split(b";")[0].strip(), 16)
             if size == 0:
-                self.rfile.readline()
+                self._skip_trailers()
                 return bytes(data)
             data += self.rfile.read(size)
             self.rfile.readline()
+
+    def _skip_trailers(self) -> None:
+        """Read the trailer headers up to the blank line, so the next request on the connection starts clean."""
+        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+            pass
 
     def _send_upstream(self, request: HttpRequest) -> HttpResponse:
         upstream = self._proxy.upstream

@@ -26,6 +26,11 @@ class EchoHandler(BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_DELETE = _echo  # noqa: N815
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Length", "42")
+        self.end_headers()
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -97,3 +102,39 @@ def test_unreachable_service_gives_502_and_an_error_not_an_exchange() -> None:
     assert status == 502
     assert exchanges == []
     assert len(errors) == 1
+
+
+def test_answers_keep_the_upstream_headers_once_and_head_keeps_its_length(upstream: Address) -> None:
+    with RecordingProxy(Address("127.0.0.1", 0), upstream) as proxy:
+        connection = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=5)
+        try:
+            connection.request("GET", "/a")
+            got = connection.getresponse()
+            got.read()
+            names = [name.lower() for name, _ in got.getheaders()]
+            connection.request("HEAD", "/a")
+            head = connection.getresponse()
+            head.read()
+        finally:
+            connection.close()
+    assert names.count("server") == 1
+    assert names.count("date") == 1
+    assert head.getheader("Content-Length") == "42"
+
+
+def test_chunk_trailers_do_not_break_the_next_request(upstream: Address) -> None:
+    raw = (
+        b"POST /v2/pet HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"3\r\nabc\r\n0\r\nX-One: 1\r\nX-Two: 2\r\n\r\n"
+        b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    with RecordingProxy(Address("127.0.0.1", 0), upstream) as proxy:
+        with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as client:
+            client.sendall(raw)
+            answer = b""
+            while chunk := client.recv(4096):
+                answer += chunk
+        exchanges, _ = proxy.log.take()
+    assert [(e.request.method, e.request.target) for e in exchanges] == [("POST", "/v2/pet"), ("GET", "/a")]
+    assert exchanges[0].request.body.data == b"abc"
+    assert answer.count(b"HTTP/1.1 ") == 2
