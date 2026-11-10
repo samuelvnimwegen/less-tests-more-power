@@ -35,11 +35,17 @@ class JavaTest:
 class JavaSuite:
     """The TestNG tests in one package of a Maven project, such as `generations.single_agent`."""
 
-    _COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+    # Literals match before comments, so a "/*" inside a string can't open a comment.
+    _LITERALS_AND_COMMENTS = re.compile(
+        r'"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
+    )
     _PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
     _TEST_METHOD = re.compile(
         r"@Test\b(?P<args>\s*\([^)]*\))?\s*(?:@\w+(?:\s*\([^)]*\))?\s*)*"
         r"public\s+(?:final\s+)?void\s+(?P<name>\w+)\s*\("
+    )
+    _CLASS_TEST = re.compile(
+        r"@Test\b(?:\s*\([^)]*\))?\s*(?:@\w+(?:\s*\([^)]*\))?\s*)*(?:public\s+)?(?:(?:final|abstract)\s+)*class\b"
     )
     _DISABLED = re.compile(r"enabled\s*=\s*false")
 
@@ -68,7 +74,9 @@ class JavaSuite:
         return sorted(found)
 
     def _tests_in(self, path: Path) -> list[JavaTest]:
-        source = self._COMMENTS.sub("", path.read_text(encoding="utf-8"))
+        source = self._LITERALS_AND_COMMENTS.sub(self._blank, path.read_text(encoding="utf-8"))
+        if self._CLASS_TEST.search(source):
+            raise ValueError(f"{path} puts @Test on the class, which lesstests does not support")
         package = self._PACKAGE.search(source)
         class_name = f"{package.group(1)}.{path.stem}" if package else path.stem
         return [
@@ -76,6 +84,18 @@ class JavaSuite:
             for match in self._TEST_METHOD.finditer(source)
             if not self._DISABLED.search(match.group("args") or "")
         ]
+
+    @staticmethod
+    def _blank(match: re.Match[str]) -> str:
+        """Empty a literal and turn a comment into a space, so a `)` or `/*` in a string can't confuse the patterns.
+
+        Returns:
+            The blanked text.
+        """
+        text = match.group()
+        if text.startswith(('"', "'")):
+            return text[0] * 2
+        return " "
 
 
 class MavenProject:

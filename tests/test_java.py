@@ -91,3 +91,31 @@ def test_a_test_that_ran_more_than_once_gets_its_worst_run(
 ) -> None:
     assert JvmRunner._read_outcome(_report_with(tmp_path, *statuses), JavaTest("s.Pet", "addPet")) is outcome
 
+TRICKY = """package s;
+
+public class Api {
+    @Test public void a() { given().accept("*/*"); }
+    @Test public void b() { }
+    @Test public void c() { given().accept("*/*").get("http://x"); }
+    @Test public void e() { char quote = '"'; }
+    @Test(description = "Add a pet (valid data)") public void d() { }
+    @Test(enabled = false, description = "a)b") public void off() { }
+    @Test public/* a comment */void f() { }
+}
+"""
+
+
+def test_discovery_ignores_comment_marks_and_brackets_inside_strings(tmp_path: Path) -> None:
+    folder = tmp_path / "src" / "test" / "java" / "s"
+    folder.mkdir(parents=True)
+    (folder / "Api.java").write_text(TRICKY)
+    assert [test.method for test in JavaSuite(tmp_path, "s").tests()] == ["a", "b", "c", "d", "e", "f"]
+
+
+def test_class_level_test_annotation_stops_discovery(tmp_path: Path) -> None:
+    folder = tmp_path / "src" / "test" / "java" / "s"
+    folder.mkdir(parents=True)
+    (folder / "Api.java").write_text("package s;\n\n@Test(enabled = true)\n@Deprecated\npublic class Api {\n}\n")
+    with pytest.raises(ValueError, match="on the class"):
+        JavaSuite(tmp_path, "s").tests()
+
