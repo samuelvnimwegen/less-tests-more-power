@@ -165,8 +165,8 @@ class Recorder:
         started = datetime.now(UTC).isoformat(timespec="seconds")
         self._recording.write_meta({**meta, "tests": len(tests), "started": started})
         with self._proxy:
-            self._service.start()
             try:
+                self._service.start()
                 for number, test in enumerate(tests, start=1):
                     if self._recording.has(test):
                         continue
