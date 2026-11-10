@@ -27,7 +27,7 @@ uv run lesstests coverage --recording runs/petstore-single
 uv run lesstests select --recording runs/petstore-single
 ```
 
-`--suite` is `single-agent` or `multi-agent`. `record` picks up where it stopped when it runs again on the same folder. `select` takes `--budgets` (default `75 50 25`), `--draws` (default 30), `--seed` and `--passing-only`, which lets both selectors pick only from tests that passed alone.
+`--suite` is `single-agent` or `multi-agent`. `record` picks up where it stopped when it runs again on the same folder. It stops if the subject, suite, project, spec or image differ from the first run, or if a recorded test left the suite. The project is copied without its `target/` and `.git` folders, so `--out` must sit outside it. Tests need `@Test` on each method. A class level `@Test` stops the run. `select` reuses the saved coverage until the recording changes. It takes `--budgets` (default `75 50 25`), `--draws` (default 30), `--seed` and `--passing-only`, which lets both selectors pick only from tests that passed alone.
 
 ## Output
 
