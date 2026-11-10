@@ -165,3 +165,38 @@ def test_recorder_stops_the_service_when_its_start_fails(tmp_path: Path, upstrea
     with pytest.raises(TimeoutError):
         recorder.run({})
     assert service.calls == ["start", "stop"]
+
+
+def test_resume_with_other_facts_stops_before_anything_runs(tmp_path: Path, upstream: Address) -> None:
+    recording = Recording(tmp_path / "rec")
+    recording.write_meta({"suite": "single-agent", "started": "old"})
+    before = (recording.folder / "meta.json").read_text()
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    recorder = Recorder(_suite(tmp_path), FakeRunner(tmp_path, proxy, service.calls), service, proxy, recording)
+    with pytest.raises(ValueError, match="suite"):
+        recorder.run({"suite": "multi-agent"})
+    assert service.calls == []
+    assert (recording.folder / "meta.json").read_text() == before
+
+
+def test_resume_with_a_test_that_left_the_suite_stops(tmp_path: Path, upstream: Address) -> None:
+    recording = Recording(tmp_path / "rec")
+    recording.save(RecordedTest(JavaTest("suite.Api", "gone"), Outcome.PASSED, 1.0))
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    recorder = Recorder(_suite(tmp_path), FakeRunner(tmp_path, proxy, service.calls), service, proxy, recording)
+    with pytest.raises(ValueError, match="suite.Api.gone"):
+        recorder.run({})
+    assert service.calls == []
+
+
+def test_resume_keeps_the_first_start_time(tmp_path: Path, upstream: Address) -> None:
+    recording = Recording(tmp_path / "rec")
+    recording.write_meta({"suite": "x", "started": "old"})
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    recorder = Recorder(_suite(tmp_path), FakeRunner(tmp_path, proxy, service.calls), service, proxy, recording)
+    recorder.run({"suite": "x"})
+    assert recording.meta()["started"] == "old"
+    assert "finished" in recording.meta()

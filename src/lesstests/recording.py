@@ -139,6 +139,26 @@ class Recording:
         self.folder.mkdir(parents=True, exist_ok=True)
         (self.folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
+    @property
+    def has_meta(self) -> bool:
+        """Whether a run already wrote its facts here."""
+        return (self.folder / "meta.json").exists()
+
+    def check_resume(self, meta: dict[str, Any], tests: list[JavaTest]) -> None:
+        """Make sure a run that goes on in this folder records the same suite as before.
+
+        Raises:
+            ValueError: If a stored fact differs from the new one, or a recorded test is no longer in the suite.
+        """
+        if self.has_meta:
+            stored = self.meta()
+            changed = sorted(key for key, value in meta.items() if stored.get(key) != value)
+            if changed:
+                raise ValueError(f"{self.folder} was recorded with another {', '.join(changed)}. Pick a new --out")
+        gone = sorted({path.stem for path in self.tests_folder.glob("*.json")} - {test.id for test in tests})
+        if gone:
+            raise ValueError(f"{self.folder} holds tests the suite no longer has: {', '.join(gone)}")
+
     def meta(self) -> dict[str, Any]:
         """Read the facts stored by `write_meta`.
 
@@ -167,7 +187,10 @@ class Recorder:
     def run(self, meta: dict[str, Any], progress: Callable[[int, int, RecordedTest], None] | None = None) -> None:
         """Record every test that has no record yet, so an interrupted run picks up where it stopped."""
         tests = self._suite.tests()
+        self._recording.check_resume(meta, tests)
         started = datetime.now(UTC).isoformat(timespec="seconds")
+        if self._recording.has_meta:
+            started = self._recording.meta().get("started", started)
         self._recording.write_meta({**meta, "tests": len(tests), "started": started})
         with self._proxy:
             try:
