@@ -1,8 +1,9 @@
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from lesstests.java import JavaSuite, JavaTest, JvmRunner, Outcome
+from lesstests.java import JavaSuite, JavaTest, JvmRunner, MavenProject, Outcome
 
 SOURCE = """package generations.single_agent;
 
@@ -70,6 +71,7 @@ def test_outcome_comes_from_the_matching_method(tmp_path: Path) -> None:
     assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "setUp")) is Outcome.ERROR
     assert JvmRunner._read_outcome(tmp_path / "missing.xml", JavaTest("a.B", "c")) is Outcome.ERROR
 
+
 def _report_with(tmp_path: Path, *statuses: str) -> Path:
     entries = "".join(f'<test-method status="{status}" name="addPet"/>' for status in statuses)
     report = tmp_path / "testng-results.xml"
@@ -90,6 +92,7 @@ def test_a_test_that_ran_more_than_once_gets_its_worst_run(
     tmp_path: Path, statuses: tuple[str, ...], outcome: Outcome
 ) -> None:
     assert JvmRunner._read_outcome(_report_with(tmp_path, *statuses), JavaTest("s.Pet", "addPet")) is outcome
+
 
 TRICKY = """package s;
 
@@ -119,3 +122,27 @@ def test_class_level_test_annotation_stops_discovery(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="on the class"):
         JavaSuite(tmp_path, "s").tests()
 
+
+def test_prepare_copies_the_whole_project_without_its_build_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""))
+    source = tmp_path / "petstore"
+    files = ("pom.xml", "src/test/java/A.java", "config.properties", ".mvn/maven.config", "target/junk", ".git/HEAD")
+    for path in files:
+        (source / path).parent.mkdir(parents=True, exist_ok=True)
+        (source / path).write_text("x")
+    copy = MavenProject(source, tmp_path / "rec" / "project")
+    copy.prepare()
+    assert (copy.workdir / "config.properties").exists()
+    assert (copy.workdir / ".mvn" / "maven.config").exists()
+    assert (copy.workdir / "src" / "test" / "java" / "A.java").exists()
+    assert not (copy.workdir / "target").exists()
+    assert not (copy.workdir / ".git").exists()
+
+
+def test_prepare_refuses_a_copy_inside_the_project(tmp_path: Path) -> None:
+    (tmp_path / "pom.xml").write_text("x")
+    with pytest.raises(ValueError, match="inside"):
+        MavenProject(tmp_path, tmp_path / "runs" / "project").prepare()
+    assert (tmp_path / "pom.xml").exists()

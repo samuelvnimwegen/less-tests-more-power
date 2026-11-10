@@ -107,16 +107,18 @@ class MavenProject:
         self.workdir = workdir
 
     def prepare(self) -> None:
-        """Copy the project, compile its tests and write the dependency classpath.
+        """Copy the whole project without its build output, compile its tests and write the dependency classpath.
 
         Raises:
+            ValueError: If the copy would sit inside the project, or the project inside the copy.
             RuntimeError: If Maven fails.
         """
-        if self.workdir.exists():
-            shutil.rmtree(self.workdir)
-        self.workdir.mkdir(parents=True)
-        shutil.copy2(self.source / "pom.xml", self.workdir / "pom.xml")
-        shutil.copytree(self.source / "src", self.workdir / "src")
+        source, workdir = self.source.resolve(), self.workdir.resolve()
+        if workdir.is_relative_to(source) or source.is_relative_to(workdir):
+            raise ValueError(f"The copy at {workdir} can't sit inside {source} or hold it. Pick another --out")
+        if workdir.exists():
+            shutil.rmtree(workdir)
+        shutil.copytree(source, workdir, ignore=shutil.ignore_patterns("target", ".git"))
         command = ["mvn", "-q", "-B", "test-compile", "dependency:build-classpath", "-Dmdep.outputFile=classpath.txt"]
         result = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:
