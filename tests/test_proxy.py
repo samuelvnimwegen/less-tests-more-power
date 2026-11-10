@@ -15,6 +15,9 @@ class EchoHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _echo(self) -> None:
+        if self.path == "/cut":
+            self._cut_off()
+            return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         answer = f"{self.command} {self.path} {body.decode()}".encode()
@@ -23,6 +26,13 @@ class EchoHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(answer)))
         self.end_headers()
         self.wfile.write(answer)
+
+    def _cut_off(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "10")
+        self.end_headers()
+        self.wfile.write(b"abc")
+        self.close_connection = True
 
     do_GET = do_POST = do_DELETE = _echo  # noqa: N815
 
@@ -62,6 +72,15 @@ def _call(port: int, method: str, target: str, body: bytes | None = None, chunke
         return answer.status, answer.read()
     finally:
         connection.close()
+
+
+def _raw(port: int, data: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+        client.sendall(data)
+        answer = b""
+        while chunk := client.recv(4096):
+            answer += chunk
+    return answer
 
 
 def test_proxy_passes_requests_on_and_records_them(upstream: Address) -> None:
@@ -129,12 +148,29 @@ def test_chunk_trailers_do_not_break_the_next_request(upstream: Address) -> None
         b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
     with RecordingProxy(Address("127.0.0.1", 0), upstream) as proxy:
-        with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as client:
-            client.sendall(raw)
-            answer = b""
-            while chunk := client.recv(4096):
-                answer += chunk
+        answer = _raw(proxy.port, raw)
         exchanges, _ = proxy.log.take()
     assert [(e.request.method, e.request.target) for e in exchanges] == [("POST", "/v2/pet"), ("GET", "/a")]
     assert exchanges[0].request.body.data == b"abc"
     assert answer.count(b"HTTP/1.1 ") == 2
+
+
+def test_answer_cut_off_by_the_service_gives_502_and_an_error(upstream: Address) -> None:
+    with RecordingProxy(Address("127.0.0.1", 0), upstream) as proxy:
+        status, _ = _call(proxy.port, "GET", "/cut")
+        exchanges, errors = proxy.log.take()
+    assert status == 502
+    assert exchanges == []
+    assert len(errors) == 1
+    assert errors[0].startswith("GET /cut")
+
+
+def test_unreadable_request_body_gives_400_and_an_error(upstream: Address) -> None:
+    raw = b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n"
+    with RecordingProxy(Address("127.0.0.1", 0), upstream) as proxy:
+        answer = _raw(proxy.port, raw)
+        exchanges, errors = proxy.log.take()
+    assert answer.startswith(b"HTTP/1.1 400")
+    assert exchanges == []
+    assert len(errors) == 1
+    assert "unreadable request body" in errors[0]

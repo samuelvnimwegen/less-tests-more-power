@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import threading
 from dataclasses import dataclass
@@ -31,10 +32,20 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
         """Keep the console quiet, the recording holds every exchange."""
 
     def _forward(self) -> None:
-        request = HttpRequest(self.command, self.path, Headers(tuple(self.headers.items())), Body(self._read_body()))
+        try:
+            body = self._read_body()
+        except (OSError, ValueError) as error:
+            self._proxy.log.fail(f"{self.command} {self.path}: unreadable request body: {error}")
+
+            # The rest of a broken body is still on the connection, so it can't carry another request.
+            self.close_connection = True
+            with contextlib.suppress(OSError):
+                self.send_error(400, "Unreadable request body")
+            return
+        request = HttpRequest(self.command, self.path, Headers(tuple(self.headers.items())), Body(body))
         try:
             response = self._send_upstream(request)
-        except OSError as error:
+        except (OSError, http.client.HTTPException) as error:
             self._proxy.log.fail(f"{request.method} {request.target}: {error}")
             self.send_error(502, "Upstream service unreachable")
             return
@@ -117,7 +128,7 @@ class ExchangeLog:
             self._exchanges.append(exchange)
 
     def fail(self, message: str) -> None:
-        """Store a request that never reached the service."""
+        """Store a request that got no full answer from the service."""
         with self._lock:
             self._errors.append(message)
 
