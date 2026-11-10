@@ -1,11 +1,16 @@
+import json
+import os
 import socket
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from lesstests.service import ContainerSpec, DockerService
+from lesstests.subjects import PETSTORE
 
 # The health check answers these in order, then 200 for good.
 ANSWERS: list[int] = []
@@ -73,9 +78,39 @@ def test_stop_removes_the_container(docker: list[tuple[str, ...]]) -> None:
     assert docker == [("rm", "-f", "lesstests-test")]
 
 
-def test_a_service_that_never_answers_times_out(docker: list[tuple[str, ...]]) -> None:
+def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
-        free_port = probe.getsockname()[1]
+        return probe.getsockname()[1]
+
+
+def test_a_service_that_never_answers_times_out(docker: list[tuple[str, ...]]) -> None:
     with pytest.raises(TimeoutError):
-        DockerService(SPEC, free_port, "lesstests-test", ready_timeout=0.5).start()
+        DockerService(SPEC, _free_port(), "lesstests-test", ready_timeout=0.5).start()
+
+
+def _status(url: str, body: dict[str, object] | None = None) -> int:
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as answer:
+            return answer.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("LESSTESTS_LIVE") != "1", reason="needs Docker and the PetStore image")
+def test_reset_puts_petstore_back_to_its_sample_data() -> None:
+    service = DockerService(PETSTORE.container, _free_port(), "lesstests-live-reset")
+    pets = f"http://{service.address.host}:{service.address.port}/v2/pet"
+    service.start()
+    try:
+        assert _status(f"{pets}/1") == 200
+        assert _status(pets, {"id": 987654, "name": "live", "photoUrls": [], "status": "available"}) == 200
+        assert _status(f"{pets}/987654") == 200
+        service.reset()
+        assert _status(f"{pets}/987654") == 404
+        assert _status(f"{pets}/1") == 200
+    finally:
+        service.stop()
