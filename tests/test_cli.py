@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,33 @@ def test_select_measures_the_suite_once_then_reuses_the_saved_coverage(
     cli.main(args)
     assert all(recording.folder / "selection" in logs.parents for logs in fake.measured)
     assert len(fake.measured) == 3
+
+
+def test_select_measures_again_when_the_recording_changed(
+    tmp_path: Path, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    fake, _ = restcov
+    recording = _recording(tmp_path / "rec")
+    args = ["select", "--recording", str(recording.folder), "--restcov", "restcov.py", "--budgets", "50"]
+    args += ["--draws", "2"]
+    cli.main(args)
+    saved = recording.folder / "coverage" / "coverage.json"
+
+    # A new test: 5 single tests, the whole suite and 3 versions.
+    exchange = Exchange(HttpRequest("GET", "/v2/e", Headers(), Body()), HttpResponse(200, "OK", Headers(), Body()))
+    recording.save(RecordedTest(JavaTest("suite.Api", "e"), Outcome.PASSED, 1.0, [exchange]))
+    fake.measured.clear()
+    cli.main(args)
+    assert len(fake.measured) == 9
+    assert json.loads((recording.folder / "selection" / "selection.json").read_text())["tests"] == 5
+
+    # The same test recorded again. The saved file is pushed back in time, so the order doesn't hang on the clock.
+    recording.save(RecordedTest(JavaTest("suite.Api", "a"), Outcome.PASSED, 1.0, [exchange]))
+    os.utime(saved, (0, 0))
+    fake.measured.clear()
+    cli.main(args)
+    assert len(fake.measured) == 9
+    assert json.loads(saved.read_text())["tests"]["suite.Api.a"] == [["path", "GET /v2/e HTTP/1.1"]]
 
 
 def test_coverage_takes_restcov_from_the_environment(

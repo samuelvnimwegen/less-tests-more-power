@@ -131,9 +131,8 @@ class SelectCommand(RecordingCommand):
         recording = Recording(args.recording.resolve())
         restcov = self.restcov(args, recording)
         saved = recording.folder / "coverage" / "coverage.json"
-        if saved.exists():
-            coverage = SuiteCoverage.load(saved)
-        else:
+        coverage = SuiteCoverage.load_if_current(saved, recording)
+        if coverage is None:
             coverage = SuiteCoverage.measure(recording, restcov, recording.folder / "coverage")
             coverage.save(saved)
         budgets = [Budget(percent / 100) for percent in args.budgets]

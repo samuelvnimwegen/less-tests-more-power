@@ -314,6 +314,18 @@ class SuiteCoverage:
             raise ValueError("The items of the single tests do not add up to the items of the whole suite")
         return coverage
 
+    @classmethod
+    def load_if_current(cls, path: Path, recording: Recording) -> Self | None:
+        """Read saved coverage, but only while it still belongs to the recording.
+
+        Returns:
+            The coverage, or None when the file is missing, older than a record, or holds other tests.
+        """
+        if not path.exists() or path.stat().st_mtime < recording.last_change:
+            return None
+        coverage = cls.load(path)
+        return coverage if set(coverage.per_test) == {record.test for record in recording.records()} else None
+
     def of(self, tests: Iterable[JavaTest]) -> CoverageSet:
         """Join the items of some tests.
 

@@ -78,6 +78,11 @@ class Recording:
         """Where the RESTCov log folders live."""
         return self.folder / "restcov-logs"
 
+    @property
+    def last_change(self) -> float:
+        """The time the newest record was saved, or 0 when there is none."""
+        return max((path.stat().st_mtime for path in self.tests_folder.glob("*.json")), default=0.0)
+
     def has(self, test: JavaTest) -> bool:
         """Check whether a test is already recorded.
 
