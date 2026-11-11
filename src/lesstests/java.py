@@ -178,6 +178,7 @@ class JvmSettings:
     """Extra system properties, environment variables and TestNG listeners for a test JVM."""
 
     SHORTEST_HIDDEN_VALUE: ClassVar[int] = 8
+    _BEARER_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[\w.~+/=-]{8,}")
 
     properties: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
@@ -216,19 +217,19 @@ class JvmSettings:
         """
         return {**os.environ, **self.env} if self.env else None
 
-    def hide_env_values(self, text: str) -> str:
-        """Replace every env value of `SHORTEST_HIDDEN_VALUE` characters or more with `<redacted>`.
+    def hide_secrets(self, text: str) -> str:
+        """Replace every bearer token and every env value of `SHORTEST_HIDDEN_VALUE` characters or more.
 
-        The env holds credentials, and a client that logs its token request prints them. A shorter value would
-        also wipe out ordinary words and numbers.
+        The env holds credentials. A client that logs its requests prints them, and also the access token it got
+        for them, which the env never held. A shorter env value would also wipe out ordinary words and numbers.
 
         Returns:
-            The text without those values.
+            The text with `<redacted>` in their place.
         """
         for value in sorted(self.env.values(), key=len, reverse=True):
             if len(value) >= self.SHORTEST_HIDDEN_VALUE:
                 text = text.replace(value, "<redacted>")
-        return text
+        return self._BEARER_TOKEN.sub(r"\1<redacted>", text)
 
 
 class Outcome(StrEnum):
@@ -368,7 +369,7 @@ class JvmRunner:
             )
         except subprocess.TimeoutExpired:
             return False
-        console = self._settings.hide_env_values(result.stdout + result.stderr)
+        console = self._settings.hide_secrets(result.stdout + result.stderr)
         (reports / "console.log").write_text(console, encoding="utf-8")
         return True
 

@@ -224,13 +224,17 @@ def test_run_suite_runs_every_test_in_one_jvm_from_a_suite_file(
     assert (tmp_path / "out" / "round-1-original" / "console.log").read_text() == "out"
 
 
-def test_the_console_log_hides_long_env_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_console_log_hides_long_env_values_and_bearer_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     token = "1//0refresh-token"
+    printed = f"refresh_token={token}&id=short\nHeaders:\t\tAuthorization=Bearer ya29.a0Af-x_1/2+3=\n"
+    printed += 'WWW-Authenticate: Bearer realm="x"\n'
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         reports = Path(command[command.index("-d") + 1])
         (reports / "testng-results.xml").write_text(SUITE_RESULTS)
-        return subprocess.CompletedProcess(command, 0, f"refresh_token={token}&id=short\n", f"{token}\n")
+        return subprocess.CompletedProcess(command, 0, printed, f"{token}\n")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     settings = JvmSettings(env={"GOOGLE_REFRESH_TOKEN": token, "GOOGLE_CLIENT_ID": "short"})
@@ -239,7 +243,8 @@ def test_the_console_log_hides_long_env_values(tmp_path: Path, monkeypatch: pyte
     console = (tmp_path / "out" / "generations.Files.list" / "console.log").read_text()
 
     # A value shorter than 8 characters stays, since hiding it would also hit ordinary words.
-    assert console == "refresh_token=<redacted>&id=short\n<redacted>\n"
+    expected = "refresh_token=<redacted>&id=short\nHeaders:\t\tAuthorization=Bearer <redacted>\n"
+    assert console == expected + 'WWW-Authenticate: Bearer realm="x"\n<redacted>\n'
 
 
 def test_run_suite_counts_every_test_as_an_error_when_the_jvm_hangs(

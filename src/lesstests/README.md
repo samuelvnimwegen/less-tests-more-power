@@ -23,7 +23,7 @@ export LESSTESTS_RESTCOV=/path/to/RESTCov/restcov.py
 
 PetStore runs from the local image `petstore-local:f673af60-lf-20261005`. The proxy takes port 8081, where the tests send their requests, and the container takes port 8082.
 
-Google Drive needs an OAuth client of a Google account you don't mind losing data in. The tests create files and empty the Drive trash. Put `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REFRESH_TOKEN` in a file only you can read and pass it with `--env-file`. The Drive client prints its token request, so the tool replaces every value of 8 characters or more from that file with `<redacted>` in the TestNG console logs it keeps. The proxy takes port 8089. Its certificate authority lives in `~/.cache/lesstests/ca`.
+Google Drive needs an OAuth client of a Google account you don't mind losing data in. The tests create files and empty the Drive trash. Put `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REFRESH_TOKEN` in a file only you can read and pass it with `--env-file`. The Drive client prints its token request and every access token it gets, so the tool replaces every bearer token and every value of 8 characters or more from that file with `<redacted>` in the TestNG console logs it keeps. The proxy takes port 8089. Its certificate authority lives in `~/.cache/lesstests/ca`.
 
 ## Commands
 
