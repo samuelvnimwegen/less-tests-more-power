@@ -231,11 +231,15 @@ class RestCov:
     RESTCov is not shipped with this tool, because its license is CC BY-NC-SA. Pass the path to its `restcov.py`.
     """
 
-    def __init__(self, script: Path, spec: Path, python: str = sys.executable) -> None:
-        """Keep the script, the API description and the Python that runs RESTCov, which needs PyYAML."""
+    def __init__(self, script: Path, spec: Path, python: str = sys.executable, base_path: str | None = None) -> None:
+        """Keep the script, the API description and the Python that runs RESTCov, which needs PyYAML.
+
+        `base_path` is a prefix RESTCov strips on top of the servers, such as `/drive/v3` for Google Drive.
+        """
         self._script = script
         self._spec = spec
         self._python = python
+        self._base_path = base_path
 
     def measure(self, logs: Path, out: Path) -> RestCovReport:
         """Run RESTCov on a log folder.
@@ -255,6 +259,7 @@ class RestCov:
             str(logs),
             "--out",
             str(out),
+            *(["--base-path", self._base_path] if self._base_path else []),
         ]
         result = subprocess.run(command, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:

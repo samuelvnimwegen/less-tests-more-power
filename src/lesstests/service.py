@@ -87,3 +87,25 @@ class DockerService:
     @staticmethod
     def _docker(*args: str, check: bool = True) -> None:
         subprocess.run(["docker", *args], check=check, capture_output=True, text=True)
+
+
+class RemoteService:
+    """A live API the tool can't start or reset, like Google Drive. The tests reach it by its own host name."""
+
+    def __init__(self, host: str, port: int = 443) -> None:
+        """Name the host the tests call."""
+        self._address = Address(host, port)
+
+    @property
+    def address(self) -> Address:
+        """The host and port of the live API, which the intercepting proxy reaches over TLS."""
+        return self._address
+
+    def start(self) -> None:
+        """Do nothing, the API is already running."""
+
+    def reset(self) -> None:
+        """Do nothing, since a live API has no starting state the tool can go back to."""
+
+    def stop(self) -> None:
+        """Do nothing, the API keeps running."""

@@ -27,7 +27,7 @@ def restcov(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeRestCov, list[tuple[Pa
     fake = FakeRestCov()
     made: list[tuple[Path, Path]] = []
 
-    def build(script: Path, spec: Path) -> FakeRestCov:
+    def build(script: Path, spec: Path, base_path: str | None = None) -> FakeRestCov:
         made.append((script, spec))
         return fake
 
@@ -104,9 +104,10 @@ def test_coverage_without_restcov_stops_with_a_message(tmp_path: Path, monkeypat
 
 
 class FakeMaven:
-    def __init__(self, source: Path, workdir: Path) -> None:
+    def __init__(self, source: Path, workdir: Path, overlays: tuple[Any, ...] = ()) -> None:
         self.source = source
         self.workdir = workdir
+        self.overlays = overlays
 
     def prepare(self) -> None:
         pass
@@ -140,3 +141,18 @@ def test_record_wires_the_subject_and_suite_into_the_recorder(tmp_path: Path, mo
     assert recorder.service.address.port == 8082
     assert recorder.meta["suite"] == "multi-agent"
     assert recorder.meta["spec"] == str((tmp_path / "petstore").resolve() / "specification-petstore.json")
+
+
+def test_env_file_skips_comments_and_strips_quotes(tmp_path: Path) -> None:
+    path = tmp_path / "drive.env"
+    path.write_text('# Drive\nGOOGLE_CLIENT_ID="abc"\n\nGOOGLE_REFRESH_TOKEN = x=y\nbroken line\n')
+    assert cli.EnvFile.read(path) == {"GOOGLE_CLIENT_ID": "abc", "GOOGLE_REFRESH_TOKEN": "x=y"}
+    assert cli.EnvFile.read(None) == {}
+
+
+def test_record_on_google_drive_stops_without_the_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "MavenProject", FakeMaven)
+    monkeypatch.setattr(cli, "Recorder", FakeRecorder)
+    args = ["record", "--subject", "google-drive", "--project", str(tmp_path / "drive"), "--suite", "single-agent"]
+    with pytest.raises(ValueError, match="GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN"):
+        cli.main([*args, "--out", str(tmp_path / "rec")])

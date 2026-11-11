@@ -6,12 +6,10 @@ from typing import Protocol
 
 from lesstests.coverage import RestCov, SuiteCoverage
 from lesstests.java import JavaSuite, JvmRunner, MavenProject
-from lesstests.proxy import RecordingProxy
 from lesstests.recording import RecordedTest, Recorder, Recording
 from lesstests.selection import Budget
-from lesstests.service import DockerService
 from lesstests.study import SelectionStudy
-from lesstests.subjects import SUBJECTS
+from lesstests.subjects import SUBJECTS, SuiteCatalog
 
 
 class Command(Protocol):
@@ -29,6 +27,36 @@ class Command(Protocol):
         ...
 
 
+class EnvFile:
+    """A file of `NAME=value` lines, such as the OAuth credentials a live suite reads. It never lands in a recording."""
+
+    @staticmethod
+    def read(path: Path | None) -> dict[str, str]:
+        """Read the file. Blank lines and lines that start with `#` count for nothing.
+
+        Returns:
+            The variables, or none when no file was given.
+        """
+        if path is None:
+            return {}
+        found = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                name, value = stripped.split("=", 1)
+                found[name.strip()] = value.strip().strip('"').strip("'")
+        return found
+
+
+class Progress:
+    """Console lines for the long running steps."""
+
+    @staticmethod
+    def recorded(number: int, total: int, record: RecordedTest) -> None:
+        """Print one recorded test."""
+        print(f"[{number}/{total}] {record.outcome.value:7} {record.requests:3} requests  {record.test.id}", flush=True)
+
+
 class RecordCommand:
     """Runs every test of a suite alone through the proxy and stores the exchanges."""
 
@@ -41,32 +69,30 @@ class RecordCommand:
         parser.add_argument("--project", type=Path, required=True, help="the Maven project of the subject")
         parser.add_argument("--suite", required=True, help="suite name, like single-agent or multi-agent")
         parser.add_argument("--out", type=Path, required=True, help="the recording folder")
+        parser.add_argument("--env-file", type=Path, help="NAME=value lines the tests read, such as OAuth credentials")
 
     def run(self, args: argparse.Namespace) -> None:
         """Prepare the project, start the service and record."""
         subject = SUBJECTS[args.subject]
         project = args.project.resolve()
         recording = Recording(args.out.resolve())
-        maven = MavenProject(project, recording.folder / "project")
+        maven = MavenProject(project, recording.folder / "project", subject.overlays(project, args.suite))
         print(f"Compiling a copy of {project} ...", flush=True)
         maven.prepare()
-        suite = JavaSuite(maven.workdir, subject.package(args.suite))
-        service = DockerService(subject.container, subject.service_port, f"lesstests-{subject.name}")
-        proxy = RecordingProxy(subject.listen, service.address)
-        recorder = Recorder(suite, JvmRunner(maven, recording.folder / "testng"), service, proxy, recording)
+        suite = JavaSuite(maven.workdir, SuiteCatalog.source(subject, args.suite).package)
+        connection = subject.connect(EnvFile.read(args.env_file))
+        runner = JvmRunner(maven, recording.folder / "testng", settings=connection.settings)
+        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording)
         meta = {
             "subject": subject.name,
             "suite": args.suite,
             "package": suite.package,
             "project": str(project),
             "spec": str(project / subject.spec_file),
-            "image": subject.container.image,
+            "restcov_base_path": subject.restcov_base_path,
+            **subject.meta(),
         }
-        recorder.run(meta, self._progress)
-
-    @staticmethod
-    def _progress(number: int, total: int, record: RecordedTest) -> None:
-        print(f"[{number}/{total}] {record.outcome.value:7} {record.requests:3} requests  {record.test.id}", flush=True)
+        recorder.run(meta, Progress.recorded)
 
 
 class RecordingCommand:
@@ -94,7 +120,22 @@ class RecordingCommand:
         """
         if args.restcov is None:
             raise SystemExit("Give --restcov or set LESSTESTS_RESTCOV to the path of RESTCov's restcov.py")
-        return RestCov(Path(args.restcov).resolve(), Path(recording.meta()["spec"]))
+        meta = recording.meta()
+        return RestCov(Path(args.restcov).resolve(), Path(meta["spec"]), base_path=meta.get("restcov_base_path"))
+
+    @staticmethod
+    def coverage(recording: Recording, restcov: RestCov) -> SuiteCoverage:
+        """Reuse the saved coverage while it still belongs to the recording, or measure it again.
+
+        Returns:
+            The coverage.
+        """
+        saved = recording.folder / "coverage" / "coverage.json"
+        coverage = SuiteCoverage.load_if_current(saved, recording)
+        if coverage is None:
+            coverage = SuiteCoverage.measure(recording, restcov, recording.folder / "coverage")
+            coverage.save(saved)
+        return coverage
 
 
 class CoverageCommand(RecordingCommand):
@@ -130,11 +171,7 @@ class SelectCommand(RecordingCommand):
         """Run the study and print the report."""
         recording = Recording(args.recording.resolve())
         restcov = self.restcov(args, recording)
-        saved = recording.folder / "coverage" / "coverage.json"
-        coverage = SuiteCoverage.load_if_current(saved, recording)
-        if coverage is None:
-            coverage = SuiteCoverage.measure(recording, restcov, recording.folder / "coverage")
-            coverage.save(saved)
+        coverage = self.coverage(recording, restcov)
         budgets = [Budget(percent / 100) for percent in args.budgets]
         out = recording.folder / "selection"
         study = SelectionStudy(recording, coverage, restcov, budgets, args.draws, args.seed, args.passing_only)
@@ -142,7 +179,11 @@ class SelectCommand(RecordingCommand):
         print((out / "report.md").read_text(encoding="utf-8"))
 
 
-COMMANDS: tuple[Command, ...] = (RecordCommand(), CoverageCommand(), SelectCommand())
+COMMANDS: tuple[Command, ...] = (
+    RecordCommand(),
+    CoverageCommand(),
+    SelectCommand(),
+)
 
 
 def main(argv: list[str] | None = None) -> None:

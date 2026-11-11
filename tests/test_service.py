@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from lesstests.service import ContainerSpec, DockerService
+from lesstests.service import ContainerSpec, DockerService, RemoteService
 from lesstests.subjects import PETSTORE
 
 # The health check answers these in order, then 200 for good.
@@ -114,3 +114,12 @@ def test_reset_puts_petstore_back_to_its_sample_data() -> None:
         assert _status(f"{pets}/1") == 200
     finally:
         service.stop()
+
+
+def test_a_remote_service_names_its_host_and_never_touches_it(docker: list[tuple[str, ...]]) -> None:
+    service = RemoteService("www.googleapis.com")
+    service.start()
+    service.reset()
+    service.stop()
+    assert (service.address.host, service.address.port) == ("www.googleapis.com", 443)
+    assert docker == []

@@ -8,7 +8,7 @@ from typing import Any, Self
 
 from lesstests.exchange import Exchange
 from lesstests.java import JavaSuite, JavaTest, JvmRunner, Outcome
-from lesstests.proxy import RecordingProxy
+from lesstests.proxy import Proxy
 from lesstests.service import Service
 
 
@@ -57,6 +57,28 @@ class RecordedTest:
         )
 
 
+class RestCovLogFolder:
+    """A folder of numbered `-request.txt` and `-response.txt` files, the log format RESTCov reads."""
+
+    def __init__(self, folder: Path) -> None:
+        """Point at the folder, which may not exist yet."""
+        self.folder = folder
+
+    def write(self, exchanges: Iterable[Exchange]) -> Path:
+        """Write the exchanges, replacing whatever the folder held.
+
+        Returns:
+            The folder.
+        """
+        if self.folder.exists():
+            shutil.rmtree(self.folder)
+        self.folder.mkdir(parents=True)
+        for number, exchange in enumerate(exchanges, start=1):
+            (self.folder / f"{number}-request.txt").write_text(exchange.request.to_restcov_text(), encoding="utf-8")
+            (self.folder / f"{number}-response.txt").write_text(exchange.response.to_restcov_text(), encoding="utf-8")
+        return self.folder
+
+
 class Recording:
     """A folder that holds one recorded suite.
 
@@ -94,13 +116,7 @@ class Recording:
     def save(self, record: RecordedTest) -> None:
         """Write the record and its RESTCov logs, replacing any older ones."""
         self.tests_folder.mkdir(parents=True, exist_ok=True)
-        logs = self.logs_of(record.test)
-        if logs.exists():
-            shutil.rmtree(logs)
-        logs.mkdir(parents=True)
-        for number, exchange in enumerate(record.exchanges, start=1):
-            (logs / f"{number}-request.txt").write_text(exchange.request.to_restcov_text(), encoding="utf-8")
-            (logs / f"{number}-response.txt").write_text(exchange.response.to_restcov_text(), encoding="utf-8")
+        RestCovLogFolder(self.logs_of(record.test)).write(record.exchanges)
         self._record_path(record.test).write_text(json.dumps(record.to_dict(), indent=1), encoding="utf-8")
 
     def records(self) -> list[RecordedTest]:
@@ -175,7 +191,7 @@ class Recorder:
     """The Record step. Runs every test alone after a reset, with the proxy writing down each exchange."""
 
     def __init__(
-        self, suite: JavaSuite, runner: JvmRunner, service: Service, proxy: RecordingProxy, recording: Recording
+        self, suite: JavaSuite, runner: JvmRunner, service: Service, proxy: Proxy, recording: Recording
     ) -> None:
         """Wire the parts together."""
         self._suite = suite
@@ -184,9 +200,17 @@ class Recorder:
         self._proxy = proxy
         self._recording = recording
 
-    def run(self, meta: dict[str, Any], progress: Callable[[int, int, RecordedTest], None] | None = None) -> None:
-        """Record every test that has no record yet, so an interrupted run picks up where it stopped."""
-        tests = self._suite.tests()
+    def run(
+        self,
+        meta: dict[str, Any],
+        progress: Callable[[int, int, RecordedTest], None] | None = None,
+        tests: list[JavaTest] | None = None,
+    ) -> None:
+        """Record every test that has no record yet, so an interrupted run picks up where it stopped.
+
+        `tests` limits the run to some tests, such as the merged copies of one merge round.
+        """
+        tests = self._suite.tests() if tests is None else sorted(tests)
         self._recording.check_resume(meta, tests)
         started = datetime.now(UTC).isoformat(timespec="seconds")
         if self._recording.has_meta:
