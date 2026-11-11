@@ -2,7 +2,7 @@ import pytest
 
 from lesstests.coverage import CoverageItem, CoverageSet, Criterion, SuiteCoverage
 from lesstests.java import JavaTest
-from lesstests.selection import Budget, CoverageMatrix, CoverageSelector, RandomSelector
+from lesstests.selection import Budget, CoverageMatrix, CoverageSelector, RandomSelector, SmallestCover
 
 
 def _test(name: str) -> JavaTest:
@@ -75,3 +75,32 @@ def test_random_draws_repeat_with_the_same_seed_and_differ_between_draws() -> No
     assert first == again
     assert first != other
     assert len(first) == 10
+
+
+def _sets(reaches: dict[str, set[str]]) -> dict[JavaTest, CoverageSet]:
+    return {
+        _test(name): CoverageSet(CoverageItem(Criterion.STATUS, key) for key in keys) for name, keys in reaches.items()
+    }
+
+
+def test_smallest_cover_keeps_every_item_with_the_fewest_tests_then_requests() -> None:
+    candidates = _sets({"a": {"1", "2"}, "b": {"2", "3"}, "c": {"3"}, "d": {"1"}})
+    requests = {_test("a"): 1, _test("b"): 1, _test("c"): 5, _test("d"): 1}
+    target = CoverageSet.union(candidates.values())
+    assert SmallestCover().select(candidates, requests, target) == [_test("a"), _test("b")]
+
+
+def test_smallest_cover_only_needs_the_target_items() -> None:
+    candidates = _sets({"a": {"1", "9"}, "b": {"2"}, "m": {"1", "2"}})
+    requests = dict.fromkeys(candidates, 1)
+    target = CoverageSet.union([candidates[_test("a")], candidates[_test("b")]]) - CoverageSet(
+        [CoverageItem(Criterion.STATUS, "9")]
+    )
+    assert SmallestCover().select(candidates, requests, target) == [_test("m")]
+
+
+def test_smallest_cover_refuses_a_target_nobody_reaches() -> None:
+    candidates = _sets({"a": {"1"}})
+    target = CoverageSet([CoverageItem(Criterion.STATUS, "2")])
+    with pytest.raises(ValueError, match="No candidate reaches 1"):
+        SmallestCover().select(candidates, {_test("a"): 1}, target)
