@@ -133,7 +133,12 @@ class MergeStudy:
 
         Returns:
             The plan with Original, Select and Select + Merge.
+
+        Raises:
+            ValueError: If `out` sits inside the recording, whose project copy is the source of every merge.
         """
+        if out.resolve().is_relative_to(self._recording.folder.resolve()):
+            raise ValueError(f"--out {out} sits inside the recording, whose project copy is the merge source")
         meta = self._recording.meta()
         api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
         records = self._recording.records()

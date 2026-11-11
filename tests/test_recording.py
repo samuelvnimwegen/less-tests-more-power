@@ -200,3 +200,13 @@ def test_resume_keeps_the_first_start_time(tmp_path: Path, upstream: Address) ->
     recorder.run({"suite": "x"})
     assert recording.meta()["started"] == "old"
     assert "finished" in recording.meta()
+
+
+def test_a_resume_ignores_the_facts_every_run_writes_itself(tmp_path: Path) -> None:
+    recording = Recording(tmp_path / "round")
+    recording.write_meta({"suite": "single-agent", "tests": 1, "started": "18:00", "finished": "18:01"})
+
+    # A merge round gets the facts of the recording it came from, with that recording's own counts and times.
+    recording.check_resume({"suite": "single-agent", "tests": 7, "started": "17:00", "finished": "17:30"}, [])
+    with pytest.raises(ValueError, match="another suite"):
+        recording.check_resume({"suite": "multi-agent", "tests": 1}, [])

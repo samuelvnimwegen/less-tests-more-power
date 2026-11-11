@@ -136,3 +136,14 @@ def test_the_report_refuses_a_run_that_never_started(tmp_path: Path) -> None:
     runs[0].outcomes = {"error": 4}
     with pytest.raises(ValueError, match="never started: round 1 Original"):
         BenchReport(_plan(), runs)
+
+
+def test_a_folder_with_runs_of_another_plan_is_refused(tmp_path: Path) -> None:
+    benchmark, runner, _ = _bench(tmp_path)
+    benchmark.run(tmp_path / "bench", rounds=1, warmup=0)
+    other = VersionPlan([SuiteVersion("Original", [JavaTest("g.Files", "z")], CoverageSet(), frozenset(), 1)])
+    log = FakeLog()
+    measure = (FakeRestCov(), ApiDescription.load(tmp_path / "spec.json"))
+    stale = Benchmark(other, FakeRunner(log), contextlib.nullcontext(), log, FakeService(), measure)
+    with pytest.raises(ValueError, match="holds runs of another plan"):
+        stale.run(tmp_path / "bench", rounds=1, warmup=0)

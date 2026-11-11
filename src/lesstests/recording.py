@@ -86,6 +86,8 @@ class Recording:
     test, so any group of tests can be measured by copying its folders together.
     """
 
+    RUN_FACTS = frozenset({"tests", "started", "finished"})
+
     def __init__(self, folder: Path) -> None:
         """Point at the folder, which may not exist yet."""
         self.folder = folder
@@ -163,12 +165,16 @@ class Recording:
     def check_resume(self, meta: dict[str, Any], tests: list[JavaTest]) -> None:
         """Make sure a run that goes on in this folder records the same suite as before.
 
+        The `RUN_FACTS` are left out, since every run writes its own, and a merge round gets them from the recording.
+
         Raises:
             ValueError: If a stored fact differs from the new one, or a recorded test is no longer in the suite.
         """
         if self.has_meta:
             stored = self.meta()
-            changed = sorted(key for key, value in meta.items() if stored.get(key) != value)
+            changed = sorted(
+                key for key, value in meta.items() if key not in self.RUN_FACTS and stored.get(key) != value
+            )
             if changed:
                 raise ValueError(f"{self.folder} was recorded with another {', '.join(changed)}. Pick a new --out")
         gone = sorted({path.stem for path in self.tests_folder.glob("*.json")} - {test.id for test in tests})

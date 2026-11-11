@@ -186,6 +186,10 @@ class Overlay:
             raise FileNotFoundError(f"Nothing to put into the project at {self.source}")
 
 
+class CompileError(RuntimeError):
+    """Maven could not build the copy of a project."""
+
+
 class MavenProject:
     """A private copy of a Maven project, compiled once, so the original folder never changes."""
 
@@ -213,7 +217,7 @@ class MavenProject:
 
         Raises:
             ValueError: If the copy would sit inside the project, or the project inside the copy.
-            RuntimeError: If Maven fails.
+            CompileError: If Maven fails.
         """
         source, workdir = self.source.resolve(), self.workdir.resolve()
         if workdir.is_relative_to(source) or source.is_relative_to(workdir):
@@ -226,7 +230,7 @@ class MavenProject:
         command = ["mvn", "-q", "-B", "test-compile", "dependency:build-classpath", "-Dmdep.outputFile=classpath.txt"]
         result = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:
-            raise RuntimeError(f"Maven failed in {self.workdir}:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
+            raise CompileError(f"Maven failed in {self.workdir}:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
 
     @property
     def classpath(self) -> str:

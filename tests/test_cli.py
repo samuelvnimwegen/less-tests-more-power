@@ -151,6 +151,12 @@ def test_env_file_skips_comments_and_strips_quotes(tmp_path: Path) -> None:
     assert cli.EnvFile.read(None) == {}
 
 
+def test_env_file_reads_a_byte_order_mark_and_export_lines(tmp_path: Path) -> None:
+    path = tmp_path / "drive.env"
+    path.write_bytes(b"\xef\xbb\xbfGOOGLE_CLIENT_ID=abc\r\nexport GOOGLE_CLIENT_SECRET=def\r\n")
+    assert cli.EnvFile.read(path) == {"GOOGLE_CLIENT_ID": "abc", "GOOGLE_CLIENT_SECRET": "def"}
+
+
 def test_record_on_google_drive_stops_without_the_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "MavenProject", FakeMaven)
     monkeypatch.setattr(cli, "Recorder", FakeRecorder)
@@ -276,3 +282,19 @@ def test_merge_stops_when_its_matching_differs_from_restcov(
     args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(tmp_path / "m")]
     with pytest.raises(ValueError, match="match 1 tests to other operations, such as suite.Api.a"):
         cli.main(args)
+
+
+def test_merge_refuses_an_out_folder_inside_the_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    recording = _merge_ready_recording(tmp_path)
+    args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(recording.folder)]
+    with pytest.raises(ValueError, match="sits inside the recording"):
+        cli.main(args)
+
+
+def test_bench_needs_at_least_one_round(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["bench", "--merge", str(tmp_path), "--rounds", "0"])
+    assert "needs at least 1" in capsys.readouterr().err

@@ -134,6 +134,7 @@ class Benchmark:
         Returns:
             Every counted run.
         """
+        self._claim(out)
         runs: list[BenchRun] = []
         with self._proxy:
             try:
@@ -157,6 +158,19 @@ class Benchmark:
             finally:
                 self._service.stop()
         return runs
+
+    def _claim(self, out: Path) -> None:
+        """Tie the folder to this plan, so saved runs of another plan never end up in its report.
+
+        Raises:
+            ValueError: If the folder holds runs of another plan.
+        """
+        path = out / "runs" / "plan.json"
+        tests = {version.name: [test.id for test in version.tests] for version in self._plan.versions}
+        if path.exists() and json.loads(path.read_text(encoding="utf-8")) != tests:
+            raise ValueError(f"{out} holds runs of another plan. Pick a new --out")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(tests, indent=1), encoding="utf-8")
 
     @staticmethod
     def repeated(out: Path) -> int:

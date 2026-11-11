@@ -6,8 +6,8 @@ import pytest
 from lesstests.api import ApiDescription
 from lesstests.coverage import CoverageItem, CoverageSet, Criterion, SuiteCoverage
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
-from lesstests.java import JavaTest, MaskedJava, Outcome
-from lesstests.merge import JavaTestFile, MergedTest, MergePlanner, Merger
+from lesstests.java import CompileError, JavaTest, MaskedJava, Outcome
+from lesstests.merge import JavaTestFile, MapPair, MergedTest, MergePlanner, Merger
 from lesstests.recording import RecordedTest
 
 SPEC = {
@@ -185,6 +185,18 @@ class FakeRunner:
         return found
 
 
+WIDE_SPEC = {
+    "openapi": "3.0.0",
+    "paths": {
+        "/files": {
+            "get": {
+                "parameters": [{"in": "query", "name": name} for name in ("corpora", "orderBy", "p1", "p2", "p3", "p4")]
+            }
+        }
+    },
+}
+
+
 def _wide_source(donors: list[str]) -> tuple[str, dict[str, tuple[str, str, int]]]:
     methods = []
     targets = {}
@@ -201,23 +213,11 @@ def _wide_source(donors: list[str]) -> tuple[str, dict[str, tuple[str, str, int]
 def test_a_merge_that_changes_the_status_gets_split_until_the_bad_donor_is_alone(tmp_path: Path) -> None:
     donors = ["d1", "d2", "d3", "bad"]
     source, targets = _wide_source(donors)
-    spec = {
-        "openapi": "3.0.0",
-        "paths": {
-            "/files": {
-                "get": {
-                    "parameters": [
-                        {"in": "query", "name": name} for name in ("corpora", "orderBy", "p1", "p2", "p3", "p4")
-                    ]
-                }
-            }
-        },
-    }
     root = tmp_path / "java"
     (root / "generations").mkdir(parents=True)
     (root / "generations" / "Files.java").write_text(source)
     records = [_record(JavaTest("generations.Files", name), *target) for name, target in targets.items()]
-    api = _api(tmp_path, spec)
+    api = _api(tmp_path, WIDE_SPEC)
     runner = FakeRunner({"bad"})
     outcome = Merger(MergePlanner(records, api, root), runner, api, rounds=4).run(tmp_path / "rounds")
 
@@ -280,6 +280,36 @@ def _coverage_with(operations: dict[str, str]) -> SuiteCoverage:
     return SuiteCoverage(per_test, CoverageSet.union(per_test.values()), {})
 
 
+class CompileRunner(FakeRunner):
+    """Fails to compile every round that holds a merge with the donor `bad`."""
+
+    def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
+        if any(donor.method == "bad" for merge in merged for donor in merge.donors):
+            raise CompileError(f"Maven failed in {folder}")
+        return super().record(merged, edited, folder)
+
+
+def test_a_copy_that_does_not_compile_only_drops_itself(tmp_path: Path) -> None:
+    source, targets = _wide_source(["d1", "d2", "d3", "bad"])
+    root = tmp_path / "java"
+    (root / "generations").mkdir(parents=True)
+    (root / "generations" / "Files.java").write_text(source)
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in targets.items()]
+    api = _api(tmp_path, WIDE_SPEC)
+    outcome = Merger(MergePlanner(records, api, root), CompileRunner(set()), api, rounds=4).run(tmp_path / "rounds")
+
+    kept = sorted(sorted(donor.method for donor in merge.donors) for merge in outcome.accepted)
+    assert kept == [["d1", "d2"], ["d3"]]
+    assert [attempt["reason"] for attempt in outcome.attempts if not attempt["kept"]] == ["didn't compile"] * 3
+
+
+def test_a_copy_lands_in_the_class_named_like_the_file(tmp_path: Path) -> None:
+    source = SOURCE + "\nclass FilesHelper {\n    void help() {}\n}\n"
+    planner = _planner(tmp_path, source)
+    text = next(iter(planner.edited_files(planner.first_round()).values()))
+    assert text.index("lesstestsMerged1") < text.index("class FilesHelper")
+
+
 def test_matching_that_differs_from_restcov_stops_the_merge(tmp_path: Path) -> None:
     records = [_record(JavaTest("generations.Files", name), *target) for name, target in TARGETS.items()]
     operations = {name: f"{method} /files" for name, (method, _, _) in TARGETS.items()}
@@ -318,3 +348,8 @@ public class Files {
     # Found on PetStore, where a merged copy sent `status=available&status=available`.
     targets = {"base": ("GET", "/files?corpora=user", 200), "donor": ("GET", "/files?corpora=drive", 200)}
     assert _planner(tmp_path, source, targets).first_round() == []
+
+
+def test_a_key_with_a_java_escape_gives_its_real_name() -> None:
+    # Java writes `it's` as "it\'s", and JSON doesn't know that escape.
+    assert MapPair('"it\\\'s"', "1").name == "it's"

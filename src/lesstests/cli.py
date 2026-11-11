@@ -48,8 +48,9 @@ class EnvFile:
         if path is None:
             return {}
         found = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
+        # An editor may save a byte order mark, and a shell file may write `export NAME=value`.
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            stripped = line.strip().removeprefix("export ")
             if stripped and not stripped.startswith("#") and "=" in stripped:
                 name, value = stripped.split("=", 1)
                 found[name.strip()] = value.strip().strip('"').strip("'")
@@ -235,11 +236,26 @@ class BenchCommand:
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Declare the merge folder, the rounds, RESTCov and the credentials."""
         parser.add_argument("--merge", type=Path, required=True, help="a folder made by `lesstests merge`")
-        parser.add_argument("--rounds", type=int, default=10)
+        parser.add_argument("--rounds", type=self.at_least_one, default=10)
         parser.add_argument("--warmup", type=int, default=1, help="Original runs before the counted rounds")
         parser.add_argument("--out", type=Path, help="the benchmark folder, by default `bench` in the merge folder")
         RestCovOption.add_argument(parser)
         EnvFile.add_argument(parser)
+
+    @staticmethod
+    def at_least_one(text: str) -> int:
+        """Read a number of rounds, since a report needs at least one.
+
+        Returns:
+            The number.
+
+        Raises:
+            argparse.ArgumentTypeError: If it's below 1.
+        """
+        number = int(text)
+        if number < 1:
+            raise argparse.ArgumentTypeError("needs at least 1")
+        return number
 
     def run(self, args: argparse.Namespace) -> None:
         """Run the benchmark and print the report."""

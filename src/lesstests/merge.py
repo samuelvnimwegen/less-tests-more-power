@@ -1,6 +1,6 @@
 """The Merge step: one test takes over the parameter names of other tests that hit the same operation and status."""
 
-import json
+import ast
 import re
 from collections import defaultdict
 from collections.abc import Iterable
@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from lesstests.api import ApiDescription
 from lesstests.coverage import CoverageSet, Criterion, SuiteCoverage
-from lesstests.java import JavaSuite, JavaTest, MaskedJava
+from lesstests.java import CompileError, JavaSuite, JavaTest, MaskedJava
 from lesstests.recording import RecordedTest
 
 
@@ -25,8 +25,8 @@ class MapPair:
 
     @property
     def name(self) -> str:
-        """The key without its quotes."""
-        return json.loads(self.key)
+        """The key without its quotes, with its escape sequences read the way the Java compiler reads them."""
+        return ast.literal_eval(self.key)
 
     @property
     def portable(self) -> bool:
@@ -136,13 +136,19 @@ class JavaTestFile:
         return TestMethodSource(self.path, match.start(), body_close + 1, *name_span, params, headers)
 
     def with_methods(self, methods: Iterable[str]) -> str:
-        """Add methods to the end of the class.
+        """Add methods to the end of the class named like the file, since a helper class may follow it.
 
         Returns:
             The new file text.
+
+        Raises:
+            ValueError: If the file holds no class named like it.
         """
+        header = re.search(rf"\bclass\s+{re.escape(self.path.stem)}\b[^{{]*\{{", self.source.masked)
+        if header is None:
+            raise ValueError(f"{self.path} holds no class {self.path.stem}")
+        last = self.source.closing(header.end() - 1)
         text = self.source.text
-        last = self.source.masked.rindex("}")
         added = "".join(f"\n    {method}\n" for method in methods)
         return text[:last] + added + text[last:]
 
@@ -469,12 +475,11 @@ class Merger:
         for round_number in range(1, self._rounds + 1):
             if not pending:
                 break
-            edited = self._planner.edited_files([*accepted, *pending])
-            recorded = self._runner.record(pending, edited, folder / f"round-{round_number}")
+            recorded, broken = self._record(pending, accepted, folder / f"round-{round_number}")
             failed = []
             for merge in pending:
                 record = recorded.get(merge.test)
-                reason = self._rejection(merge, record)
+                reason = "didn't compile" if merge.test in broken else self._rejection(merge, record)
                 attempts.append({**merge.to_dict(), "kept": reason is None, "reason": reason})
                 if reason is None and record is not None:
                     accepted.append(merge)
@@ -484,6 +489,29 @@ class Merger:
             pending = self._planner.split(failed, round_number + 1, number)
             number += len(pending)
         return MergeOutcome(accepted, records, attempts)
+
+    def _record(
+        self, pending: list[MergedTest], accepted: list[MergedTest], folder: Path
+    ) -> tuple[dict[JavaTest, RecordedTest], set[JavaTest]]:
+        """Record a round. When it doesn't compile, every copy gets its own try, so a bad copy only drops itself.
+
+        Returns:
+            The record of each merged test, and the merged tests that didn't compile.
+        """
+        try:
+            return self._runner.record(pending, self._planner.edited_files([*accepted, *pending]), folder), set()
+        except CompileError:
+            if len(pending) == 1:
+                return {}, {pending[0].test}
+        recorded: dict[JavaTest, RecordedTest] = {}
+        broken: set[JavaTest] = set()
+        for number, merge in enumerate(pending, start=1):
+            alone = folder.with_name(f"{folder.name}-alone-{number}")
+            try:
+                recorded |= self._runner.record([merge], self._planner.edited_files([*accepted, merge]), alone)
+            except CompileError:
+                broken.add(merge.test)
+        return recorded, broken
 
     def _rejection(self, merge: MergedTest, record: RecordedTest | None) -> str | None:
         """Say why a merged copy can't stay, or None when it can.
