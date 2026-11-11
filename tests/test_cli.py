@@ -1,12 +1,13 @@
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fake_restcov import FakeRestCov
 
-from lesstests import cli
+from lesstests import cli, merge_study
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
 from lesstests.java import JavaTest, Outcome
 from lesstests.recording import RecordedTest, Recording
@@ -156,3 +157,122 @@ def test_record_on_google_drive_stops_without_the_credentials(tmp_path: Path, mo
     args = ["record", "--subject", "google-drive", "--project", str(tmp_path / "drive"), "--suite", "single-agent"]
     with pytest.raises(ValueError, match="GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN"):
         cli.main([*args, "--out", str(tmp_path / "rec")])
+
+
+class TrackedMaven(FakeMaven):
+    made: list["TrackedMaven"] = []
+
+    def __init__(self, source: Path, workdir: Path, overlays: tuple[Any, ...] = ()) -> None:
+        super().__init__(source, workdir, overlays)
+        TrackedMaven.made.append(self)
+
+
+def _merge_ready_recording(tmp_path: Path) -> Recording:
+    recording = _recording(tmp_path / "rec")
+    (tmp_path / "spec.json").write_text(json.dumps({"openapi": "3.0.0", "paths": {}}))
+    meta = {"subject": "petstore", "suite": "single-agent", "package": "generations.single_agent"}
+    recording.write_meta({**meta, "project": str(tmp_path / "petstore"), "spec": str(tmp_path / "spec.json")})
+    return recording
+
+
+def test_merge_without_merges_still_compiles_the_project_and_plans_three_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    TrackedMaven.made.clear()
+    recording = _merge_ready_recording(tmp_path)
+    out = tmp_path / "merge"
+    cli.main(["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(out)])
+
+    merges = json.loads((out / "merges.json").read_text())
+    assert (merges["accepted"], merges["attempts"]) == ([], [])
+
+    # The description documents no operation, so every one-request test is listed with that reason.
+    assert {entry["reason"] for entry in merges["skipped"]} == {"its request matched no documented operation"}
+    assert len(merges["skipped"]) == 4
+    assert json.loads((out / "meta.json").read_text())["recording"] == str(recording.folder.resolve())
+    assert [maven.workdir for maven in TrackedMaven.made] == [out.resolve() / "project"]
+    versions = json.loads((out / "plan.json").read_text())["versions"]
+    assert [(version["name"], len(version["tests"])) for version in versions] == [
+        ("Original", 4),
+        ("Select", 4),
+        ("Select + Merge", 4),
+    ]
+
+
+class FakeBenchmark:
+    made: list["FakeBenchmark"] = []
+
+    def __init__(self, plan: Any, runner: Any, proxy: Any, log: Any, service: Any, measure: Any) -> None:
+        self.plan = plan
+        self.runner = runner
+        self.args: tuple[Any, ...] = ()
+        FakeBenchmark.made.append(self)
+
+    def run(self, out: Path, rounds: int, warmup: int = 1, progress: Any = None) -> list[Any]:
+        self.args = (out, rounds, warmup)
+        out.mkdir(parents=True, exist_ok=True)
+        return []
+
+    @staticmethod
+    def repeated(out: Path) -> int:
+        return 0
+
+
+class FakeBenchReport:
+    def __init__(self, plan: Any, runs: list[Any], repeated: int = 0) -> None:
+        pass
+
+    def markdown(self) -> str:
+        return "report\n"
+
+
+@dataclass
+class FakeRunner:
+    project: Any
+    output: Path
+    timeout: float = 300.0
+    settings: Any = None
+
+
+def test_bench_runs_the_merge_projects_copy_with_the_recordings_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "merge"
+    folder.mkdir()
+    (tmp_path / "spec.json").write_text(json.dumps({"openapi": "3.0.0", "paths": {}}))
+    meta = {"subject": "petstore", "spec": str(tmp_path / "spec.json"), "restcov_base_path": "/v2"}
+    (folder / "meta.json").write_text(json.dumps({**meta, "project": str(tmp_path / "petstore")}))
+    (folder / "plan.json").write_text(json.dumps({"versions": []}))
+    base_paths: list[str | None] = []
+
+    def build(script: Path, spec: Path, base_path: str | None = None) -> FakeRestCov:
+        base_paths.append(base_path)
+        return FakeRestCov()
+
+    monkeypatch.setattr(cli, "RestCov", build)
+    monkeypatch.setattr(cli, "JvmRunner", FakeRunner)
+    monkeypatch.setattr(cli, "Benchmark", FakeBenchmark)
+    monkeypatch.setattr(cli, "BenchReport", FakeBenchReport)
+    FakeBenchmark.made.clear()
+    cli.main(["bench", "--merge", str(folder), "--rounds", "3", "--restcov", "restcov.py"])
+
+    bench = FakeBenchmark.made[0]
+    assert base_paths == ["/v2"]
+    assert bench.runner.project.workdir == folder.resolve() / "project"
+    assert bench.runner.output == folder.resolve() / "bench"
+    assert bench.args == (folder.resolve() / "bench", 3, 1)
+    assert (folder / "bench" / "report.md").read_text() == "report\n"
+
+
+def test_merge_stops_when_its_matching_differs_from_restcov(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    recording = _merge_ready_recording(tmp_path)
+
+    # The tool matches GET /v2/a to an operation, but the fake RESTCov only ever reports path items.
+    (tmp_path / "spec.json").write_text(json.dumps({"openapi": "3.0.0", "paths": {"/v2/a": {"get": {}}}}))
+    args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(tmp_path / "m")]
+    with pytest.raises(ValueError, match="match 1 tests to other operations, such as suite.Api.a"):
+        cli.main(args)

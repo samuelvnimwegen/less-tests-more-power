@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 
 from lesstests.api import ApiDescription
+from lesstests.coverage import CoverageItem, CoverageSet, Criterion, SuiteCoverage
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
-from lesstests.java import JavaTest, Outcome
-from lesstests.merge import JavaTestFile, MaskedJava, MergedTest, MergePlanner, Merger
+from lesstests.java import JavaTest, MaskedJava, Outcome
+from lesstests.merge import JavaTestFile, MergedTest, MergePlanner, Merger
 from lesstests.recording import RecordedTest
 
 SPEC = {
@@ -262,9 +263,31 @@ def test_a_merged_copy_that_is_not_one_request_to_its_operation_is_dropped(
     assert {attempt["reason"] for attempt in outcome.attempts} == {reason}
 
 
-def test_a_merge_round_trips_through_json(tmp_path: Path) -> None:
-    merge = _planner(tmp_path).first_round()[0]
-    assert MergedTest.from_dict(json.loads(json.dumps(merge.to_dict()))) == merge
+def test_one_request_tests_the_planner_cannot_merge_are_listed_with_a_reason(tmp_path: Path) -> None:
+    targets = {**TARGETS, "twoCalls": ("GET", "/files", 200), "listByUser": ("GET", "/nothing", 200)}
+    planner = _planner(tmp_path, targets=targets)
+    assert sorted((test.method, reason) for test, reason in planner.skipped) == [
+        ("listByUser", "its request matched no documented operation"),
+        ("twoCalls", "its method isn't one helper call with literal maps"),
+    ]
+
+
+def _coverage_with(operations: dict[str, str]) -> SuiteCoverage:
+    per_test = {
+        JavaTest("generations.Files", name): CoverageSet([CoverageItem(Criterion.OPERATION, operation)])
+        for name, operation in operations.items()
+    }
+    return SuiteCoverage(per_test, CoverageSet.union(per_test.values()), {})
+
+
+def test_matching_that_differs_from_restcov_stops_the_merge(tmp_path: Path) -> None:
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in TARGETS.items()]
+    operations = {name: f"{method} /files" for name, (method, _, _) in TARGETS.items()}
+    MergePlanner.check_matching(records, _api(tmp_path), _coverage_with(operations))
+
+    # RESTCov saw another operation for one test, so the groups built on the tool's matching can't be trusted.
+    with pytest.raises(ValueError, match="match 1 tests to other operations, such as generations.Files.starred"):
+        MergePlanner.check_matching(records, _api(tmp_path), _coverage_with({**operations, "starred": "GET /x"}))
 
 
 @pytest.mark.parametrize("value", ['"text"', "5", "-2.5", "true", "10L", "'c'"])

@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -8,13 +7,12 @@ from typing import Any, Protocol
 from lesstests.api import ApiDescription
 from lesstests.bench import Benchmark, BenchReport, BenchRun
 from lesstests.coverage import RestCov, SuiteCoverage
-from lesstests.java import JavaSuite, JavaTest, JvmRunner, MavenProject, Overlay
-from lesstests.merge import MergedTest, MergePlanner, Merger
+from lesstests.java import JavaSuite, JvmRunner, MavenProject
+from lesstests.merge_study import MergeFolder, MergeStudy
 from lesstests.recording import RecordedTest, Recorder, Recording
 from lesstests.selection import Budget
 from lesstests.study import SelectionStudy
-from lesstests.subjects import SUBJECTS, Subject, SuiteCatalog
-from lesstests.versions import VersionPlan, VersionPlanner
+from lesstests.subjects import SUBJECTS, SuiteCatalog
 
 
 class Command(Protocol):
@@ -36,6 +34,11 @@ class EnvFile:
     """A file of `NAME=value` lines, such as the OAuth credentials a live suite reads. It never lands in a recording."""
 
     @staticmethod
+    def add_argument(parser: argparse.ArgumentParser) -> None:
+        """Declare `--env-file`."""
+        parser.add_argument("--env-file", type=Path, help="NAME=value lines the tests read, such as OAuth credentials")
+
+    @staticmethod
     def read(path: Path | None) -> dict[str, str]:
         """Read the file. Blank lines and lines that start with `#` count for nothing.
 
@@ -51,6 +54,34 @@ class EnvFile:
                 name, value = stripped.split("=", 1)
                 found[name.strip()] = value.strip().strip('"').strip("'")
         return found
+
+
+class RestCovOption:
+    """The `--restcov` argument, and RESTCov pointed at the API description a recording's facts name."""
+
+    @staticmethod
+    def add_argument(parser: argparse.ArgumentParser) -> None:
+        """Declare `--restcov`, which falls back to `LESSTESTS_RESTCOV`."""
+        parser.add_argument(
+            "--restcov",
+            type=Path,
+            default=os.environ.get("LESSTESTS_RESTCOV"),
+            help="path to RESTCov's restcov.py, or set LESSTESTS_RESTCOV",
+        )
+
+    @staticmethod
+    def restcov(args: argparse.Namespace, meta: dict[str, Any]) -> RestCov:
+        """Build RESTCov for the description and base path in the facts.
+
+        Returns:
+            RESTCov, ready to measure.
+
+        Raises:
+            SystemExit: If no path to RESTCov was given.
+        """
+        if args.restcov is None:
+            raise SystemExit("Give --restcov or set LESSTESTS_RESTCOV to the path of RESTCov's restcov.py")
+        return RestCov(Path(args.restcov).resolve(), Path(meta["spec"]), base_path=meta.get("restcov_base_path"))
 
 
 class Progress:
@@ -83,7 +114,7 @@ class RecordCommand:
         parser.add_argument("--project", type=Path, required=True, help="the Maven project of the subject")
         parser.add_argument("--suite", required=True, help="suite name, like single-agent or multi-agent")
         parser.add_argument("--out", type=Path, required=True, help="the recording folder")
-        parser.add_argument("--env-file", type=Path, help="NAME=value lines the tests read, such as OAuth credentials")
+        EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
         """Prepare the project, start the service and record."""
@@ -115,27 +146,7 @@ class RecordingCommand:
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Declare the recording and RESTCov."""
         parser.add_argument("--recording", type=Path, required=True, help="a folder made by `lesstests record`")
-        parser.add_argument(
-            "--restcov",
-            type=Path,
-            default=os.environ.get("LESSTESTS_RESTCOV"),
-            help="path to RESTCov's restcov.py, or set LESSTESTS_RESTCOV",
-        )
-
-    @staticmethod
-    def restcov(args: argparse.Namespace, recording: Recording) -> RestCov:
-        """Point RESTCov at the API description the recording names.
-
-        Returns:
-            RESTCov, ready to measure.
-
-        Raises:
-            SystemExit: If no path to RESTCov was given.
-        """
-        if args.restcov is None:
-            raise SystemExit("Give --restcov or set LESSTESTS_RESTCOV to the path of RESTCov's restcov.py")
-        meta = recording.meta()
-        return RestCov(Path(args.restcov).resolve(), Path(meta["spec"]), base_path=meta.get("restcov_base_path"))
+        RestCovOption.add_argument(parser)
 
     @staticmethod
     def coverage(recording: Recording, restcov: RestCov) -> SuiteCoverage:
@@ -161,7 +172,7 @@ class CoverageCommand(RecordingCommand):
     def run(self, args: argparse.Namespace) -> None:
         """Measure and save the coverage."""
         recording = Recording(args.recording.resolve())
-        restcov = self.restcov(args, recording)
+        restcov = RestCovOption.restcov(args, recording.meta())
         coverage = SuiteCoverage.measure(recording, restcov, recording.folder / "coverage")
         coverage.save(recording.folder / "coverage" / "coverage.json")
         print(f"Full suite: {len(coverage.full)} items, {coverage.full.counts()}")
@@ -184,56 +195,13 @@ class SelectCommand(RecordingCommand):
     def run(self, args: argparse.Namespace) -> None:
         """Run the study and print the report."""
         recording = Recording(args.recording.resolve())
-        restcov = self.restcov(args, recording)
+        restcov = RestCovOption.restcov(args, recording.meta())
         coverage = self.coverage(recording, restcov)
         budgets = [Budget(percent / 100) for percent in args.budgets]
         out = recording.folder / "selection"
         study = SelectionStudy(recording, coverage, restcov, budgets, args.draws, args.seed, args.passing_only)
         study.run(out)
         print((out / "report.md").read_text(encoding="utf-8"))
-
-
-class MergeRoundRunner:
-    """Compiles the project with one round of merged copies and records each copy alone through the proxy."""
-
-    def __init__(self, subject: Subject, meta: dict[str, Any], env: dict[str, str]) -> None:
-        """Keep what every round needs to rebuild the project and reach the API."""
-        self._subject = subject
-        self._meta = meta
-        self._env = env
-
-    def project(self, edited: dict[Path, str], folder: Path) -> MavenProject:
-        """Copy and compile the project with the edited test files on top of the subject's own overlays.
-
-        Returns:
-            The compiled copy.
-        """
-        source = Path(self._meta["project"])
-        overlays = list(self._subject.overlays(source, self._meta["suite"]))
-        for relative, text in sorted(edited.items()):
-            path = folder / "sources" / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-            overlays.append(Overlay(path, str(Path("src", "test", "java") / relative)))
-        maven = MavenProject(source, folder / "project", tuple(overlays))
-        maven.prepare()
-        return maven
-
-    def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
-        """Record every merged test of one round alone.
-
-        Returns:
-            The record of each merged test.
-        """
-        print(f"Compiling round {folder.name} with {len(merged)} merged tests ...", flush=True)
-        maven = self.project(edited, folder)
-        connection = self._subject.connect(self._env)
-        recording = Recording(folder / "recording")
-        runner = JvmRunner(maven, folder / "testng", settings=connection.settings)
-        suite = JavaSuite(maven.workdir, self._meta["package"])
-        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording)
-        recorder.run(self._meta, Progress.recorded, [merge.test for merge in merged])
-        return {record.test: record for record in recording.records()}
 
 
 class MergeCommand(RecordingCommand):
@@ -247,40 +215,15 @@ class MergeCommand(RecordingCommand):
         super().add_arguments(parser)
         parser.add_argument("--out", type=Path, required=True, help="the merge folder")
         parser.add_argument("--rounds", type=int, default=4, help="how often a failed merge may be split")
-        parser.add_argument("--env-file", type=Path, help="NAME=value lines the tests read, such as OAuth credentials")
+        EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        """Merge, record the merged tests, measure them and write the plan."""
+        """Run the Merge step and print the plan."""
         recording = Recording(args.recording.resolve())
-        out = args.out.resolve()
-        meta = recording.meta()
-        subject = SUBJECTS[meta["subject"]]
-        restcov = self.restcov(args, recording)
-        api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
+        restcov = RestCovOption.restcov(args, recording.meta())
         coverage = self.coverage(recording, restcov)
-        records = recording.records()
-        runner = MergeRoundRunner(subject, meta, EnvFile.read(args.env_file))
-        planner = MergePlanner(records, api, recording.folder / "project" / "src" / "test" / "java")
-        outcome = Merger(planner, runner, api, args.rounds).run(out / "rounds")
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "meta.json").write_text(json.dumps({**meta, "recording": str(recording.folder)}, indent=2))
-        merges = {"accepted": [merge.to_dict() for merge in outcome.accepted], "attempts": outcome.attempts}
-        (out / "merges.json").write_text(json.dumps(merges, indent=1), encoding="utf-8")
-
-        print(f"Compiling the final project with {len(outcome.accepted)} merged tests ...", flush=True)
-        runner.project(planner.edited_files(outcome.accepted), out)
-        merged_part = None
-        if outcome.accepted:
-            merged = Recording(out / "merged")
-            for record in outcome.records.values():
-                merged.save(record)
-            merged.write_meta(meta)
-            merged_records = merged.records()
-            merged_part = (SuiteCoverage.measure(merged, restcov, merged.folder / "coverage"), merged_records)
-        plan = VersionPlanner(api, (coverage, records), merged_part).plan()
-        plan.save(out / "plan.json")
-        (out / "plan.md").write_text(plan.markdown(), encoding="utf-8")
-        print(plan.markdown())
+        study = MergeStudy(recording, restcov, coverage, EnvFile.read(args.env_file), args.rounds, Progress.recorded)
+        print(study.run(args.out.resolve()).markdown())
 
 
 class BenchCommand:
@@ -295,34 +238,21 @@ class BenchCommand:
         parser.add_argument("--rounds", type=int, default=10)
         parser.add_argument("--warmup", type=int, default=1, help="Original runs before the counted rounds")
         parser.add_argument("--out", type=Path, help="the benchmark folder, by default `bench` in the merge folder")
-        parser.add_argument(
-            "--restcov",
-            type=Path,
-            default=os.environ.get("LESSTESTS_RESTCOV"),
-            help="path to RESTCov's restcov.py, or set LESSTESTS_RESTCOV",
-        )
-        parser.add_argument("--env-file", type=Path, help="NAME=value lines the tests read, such as OAuth credentials")
+        RestCovOption.add_argument(parser)
+        EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        """Run the benchmark and print the report.
-
-        Raises:
-            SystemExit: If no path to RESTCov was given.
-        """
-        if args.restcov is None:
-            raise SystemExit("Give --restcov or set LESSTESTS_RESTCOV to the path of RESTCov's restcov.py")
-        folder = args.merge.resolve()
-        out = (args.out or folder / "bench").resolve()
-        meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
-        subject = SUBJECTS[meta["subject"]]
-        plan = VersionPlan.load(folder / "plan.json")
-        base_path = meta.get("restcov_base_path")
-        restcov = RestCov(Path(args.restcov).resolve(), Path(meta["spec"]), base_path=base_path)
-        api = ApiDescription.load(Path(meta["spec"]), base_path)
-        connection = subject.connect(EnvFile.read(args.env_file))
+        """Run the benchmark and print the report."""
+        folder = MergeFolder(args.merge.resolve())
+        out = (args.out or folder.folder / "bench").resolve()
+        meta = folder.meta()
+        restcov = RestCovOption.restcov(args, meta)
+        api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
+        connection = SUBJECTS[meta["subject"]].connect(EnvFile.read(args.env_file))
 
         # The merge step already compiled this copy, and every version runs from it.
-        runner = JvmRunner(MavenProject(Path(meta["project"]), folder / "project"), out, settings=connection.settings)
+        runner = JvmRunner(MavenProject(Path(meta["project"]), folder.project), out, settings=connection.settings)
+        plan = folder.plan()
         benchmark = Benchmark(plan, runner, connection.proxy, connection.proxy.log, connection.service, (restcov, api))
         runs = benchmark.run(out, args.rounds, args.warmup, Progress.benched)
         report = BenchReport(plan, runs, Benchmark.repeated(out)).markdown()

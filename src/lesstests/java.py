@@ -34,15 +34,88 @@ class JavaTest:
         return cls(class_name, method)
 
 
-class JavaSuite:
-    """The TestNG tests in one package of a Maven project, such as `generations.single_agent`."""
+class MaskedJava:
+    """Java source with every literal and comment blanked out, at the same length, so offsets stay valid."""
 
     # Literals match before comments, so a "/*" inside a string can't open a comment.
     _LITERALS_AND_COMMENTS = re.compile(
         r'"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
     )
+
+    def __init__(self, text: str) -> None:
+        """Mask the text once."""
+        self.text = text
+        self.masked = self._LITERALS_AND_COMMENTS.sub(self._blank, text)
+
+    @staticmethod
+    def _blank(match: re.Match[str]) -> str:
+        """Keep the quotes of a literal and fill the rest with `x`, so a `(` or `,` inside it can't count.
+
+        Returns:
+            The blanked text, as long as the original.
+        """
+        text = match.group()
+        if text.startswith(('"', "'")):
+            quote = 3 if text.startswith('"""') else 1
+            return text[:quote] + "x" * (len(text) - 2 * quote) + text[-quote:]
+        return re.sub(r"[^\n]", " ", text)
+
+    def closing(self, opening: int) -> int:
+        """Find the bracket that closes the one at `opening`.
+
+        Returns:
+            The offset of the closing bracket.
+
+        Raises:
+            ValueError: If it never closes.
+        """
+        pairs = {"(": ")", "{": "}", "[": "]"}
+        stack = []
+        for offset in range(opening, len(self.masked)):
+            char = self.masked[offset]
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in pairs.values():
+                if not stack or stack.pop() != char:
+                    raise ValueError(f"Unbalanced {char!r} at {offset}")
+                if not stack:
+                    return offset
+        raise ValueError(f"The bracket at {opening} never closes")
+
+    def split_arguments(self, opening: int) -> list[tuple[int, int]]:
+        """Split the arguments of the call whose `(` sits at `opening`.
+
+        Returns:
+            The start and end offset of every argument, with the spaces around it trimmed.
+        """
+        end = self.closing(opening)
+        spans, start, depth = [], opening + 1, 0
+        for offset in range(opening + 1, end):
+            char = self.masked[offset]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                spans.append(self._trim(start, offset))
+                start = offset + 1
+        if self.masked[start:end].strip():
+            spans.append(self._trim(start, end))
+        return spans
+
+    def _trim(self, start: int, end: int) -> tuple[int, int]:
+        while start < end and self.masked[start].isspace():
+            start += 1
+        while end > start and self.masked[end - 1].isspace():
+            end -= 1
+        return start, end
+
+
+class JavaSuite:
+    """The TestNG tests in one package of a Maven project, such as `generations.single_agent`."""
+
     _PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
-    _TEST_METHOD = re.compile(
+    TEST_METHOD = re.compile(
         r"@Test\b(?P<args>\s*\([^)]*\))?\s*(?:@\w+(?:\s*\([^)]*\))?\s*)*"
         r"public\s+(?:final\s+)?void\s+(?P<name>\w+)\s*\("
     )
@@ -76,28 +149,16 @@ class JavaSuite:
         return sorted(found)
 
     def _tests_in(self, path: Path) -> list[JavaTest]:
-        source = self._LITERALS_AND_COMMENTS.sub(self._blank, path.read_text(encoding="utf-8"))
+        source = MaskedJava(path.read_text(encoding="utf-8")).masked
         if self._CLASS_TEST.search(source):
             raise ValueError(f"{path} puts @Test on the class, which lesstests does not support")
         package = self._PACKAGE.search(source)
         class_name = f"{package.group(1)}.{path.stem}" if package else path.stem
         return [
             JavaTest(class_name, match.group("name"))
-            for match in self._TEST_METHOD.finditer(source)
+            for match in self.TEST_METHOD.finditer(source)
             if not self._DISABLED.search(match.group("args") or "")
         ]
-
-    @staticmethod
-    def _blank(match: re.Match[str]) -> str:
-        """Empty a literal and turn a comment into a space, so a `)` or `/*` in a string can't confuse the patterns.
-
-        Returns:
-            The blanked text.
-        """
-        text = match.group()
-        if text.startswith(('"', "'")):
-            return text[0] * 2
-        return " "
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +189,7 @@ class Overlay:
 class MavenProject:
     """A private copy of a Maven project, compiled once, so the original folder never changes."""
 
-    _LISTENER = "LesstestsProxyListener.java"
+    LISTENER = "lesstests.LesstestsProxyListener"
 
     def __init__(self, source: Path, workdir: Path, overlays: tuple[Overlay, ...] = ()) -> None:
         """Set up the copy without making it yet. The overlays go in after the copy, in order."""
@@ -143,7 +204,9 @@ class MavenProject:
         Returns:
             The overlay.
         """
-        return Overlay(Path(__file__).parent / "support" / cls._LISTENER, f"src/test/java/lesstests/{cls._LISTENER}")
+        package, name = cls.LISTENER.rsplit(".", 1)
+        source = Path(__file__).parent / "support" / f"{name}.java"
+        return Overlay(source, str(Path("src", "test", "java", *package.split("."), f"{name}.java")))
 
     def prepare(self) -> None:
         """Copy the whole project without its build output, apply the overlays, compile and write the classpath.
@@ -251,14 +314,10 @@ class RunResult:
 
 @dataclass(frozen=True, slots=True)
 class SuiteRun:
-    """The outcome of every test of one whole run in a single JVM.
-
-    `seconds` is the wall clock of the whole JVM. `test_seconds` adds up what TestNG timed per test.
-    """
+    """The outcome of every test of one whole run in a single JVM, with the wall clock of that JVM."""
 
     outcomes: dict[JavaTest, Outcome]
     seconds: float
-    test_seconds: float
 
 
 class JvmRunner:
@@ -275,11 +334,6 @@ class JvmRunner:
         self._output = output
         self._timeout = timeout
         self._settings = settings or JvmSettings()
-
-    @property
-    def settings(self) -> JvmSettings:
-        """The settings every JVM of this runner gets."""
-        return self._settings
 
     def run(self, test: JavaTest) -> RunResult:
         """Run one test alone.
@@ -309,9 +363,9 @@ class JvmRunner:
         seconds = time.monotonic() - started
         report = reports / "testng-results.xml"
         if not finished:
-            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), seconds, 0.0)
+            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), seconds)
         outcomes = {test: self._read_outcome(report, test) for test in tests}
-        return SuiteRun(outcomes, seconds, self._read_seconds(report, tests))
+        return SuiteRun(outcomes, seconds)
 
     @staticmethod
     def suite_xml(tests: Iterable[JavaTest], name: str) -> str:
@@ -401,21 +455,3 @@ class JvmRunner:
             return Outcome.ERROR
         found = {cls._STATUS.get(method.get("status", ""), Outcome.ERROR) for method in cls._methods(report, test)}
         return next((outcome for outcome in cls._WORST_FIRST if outcome in found), Outcome.ERROR)
-
-    @classmethod
-    def _read_seconds(cls, report: Path, tests: Iterable[JavaTest]) -> float:
-        """Add up the time TestNG measured for these tests, every run of a test included.
-
-        Returns:
-            The seconds, 0 when the report is missing.
-        """
-        if not report.exists():
-            return 0.0
-        wanted = set(tests)
-        total_ms = 0
-        for class_node in ET.parse(report).iter("class"):
-            for method in class_node.iter("test-method"):
-                test = JavaTest(class_node.get("name", ""), method.get("name", ""))
-                if test in wanted and method.get("is-config") != "true":
-                    total_ms += int(method.get("duration-ms") or 0)
-        return total_ms / 1000

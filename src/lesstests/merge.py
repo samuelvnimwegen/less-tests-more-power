@@ -6,89 +6,12 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, Self
-from urllib.parse import parse_qsl, urlsplit
+from typing import Any, Protocol
 
-from lesstests.api import ApiDescription, Operation
-from lesstests.exchange import Exchange
-from lesstests.java import JavaTest
+from lesstests.api import ApiDescription
+from lesstests.coverage import CoverageSet, Criterion, SuiteCoverage
+from lesstests.java import JavaSuite, JavaTest, MaskedJava
 from lesstests.recording import RecordedTest
-
-
-class MaskedJava:
-    """Java source with every literal and comment blanked out, at the same length, so offsets stay valid."""
-
-    _LITERALS_AND_COMMENTS = re.compile(
-        r'"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
-    )
-
-    def __init__(self, text: str) -> None:
-        """Mask the text once."""
-        self.text = text
-        self.masked = self._LITERALS_AND_COMMENTS.sub(self._blank, text)
-
-    @staticmethod
-    def _blank(match: re.Match[str]) -> str:
-        """Keep the quotes of a literal and fill the rest with `x`, so a `(` or `,` inside it can't count.
-
-        Returns:
-            The blanked text, as long as the original.
-        """
-        text = match.group()
-        if text.startswith(('"', "'")):
-            quote = 3 if text.startswith('"""') else 1
-            return text[:quote] + "x" * (len(text) - 2 * quote) + text[-quote:]
-        return re.sub(r"[^\n]", " ", text)
-
-    def closing(self, opening: int) -> int:
-        """Find the bracket that closes the one at `opening`.
-
-        Returns:
-            The offset of the closing bracket.
-
-        Raises:
-            ValueError: If it never closes.
-        """
-        pairs = {"(": ")", "{": "}", "[": "]"}
-        stack = []
-        for offset in range(opening, len(self.masked)):
-            char = self.masked[offset]
-            if char in pairs:
-                stack.append(pairs[char])
-            elif char in pairs.values():
-                if not stack or stack.pop() != char:
-                    raise ValueError(f"Unbalanced {char!r} at {offset}")
-                if not stack:
-                    return offset
-        raise ValueError(f"The bracket at {opening} never closes")
-
-    def split_arguments(self, opening: int) -> list[tuple[int, int]]:
-        """Split the arguments of the call whose `(` sits at `opening`.
-
-        Returns:
-            The start and end offset of every argument, with the spaces around it trimmed.
-        """
-        end = self.closing(opening)
-        spans, start, depth = [], opening + 1, 0
-        for offset in range(opening + 1, end):
-            char = self.masked[offset]
-            if char in "([{":
-                depth += 1
-            elif char in ")]}":
-                depth -= 1
-            elif char == "," and depth == 0:
-                spans.append(self._trim(start, offset))
-                start = offset + 1
-        if self.masked[start:end].strip():
-            spans.append(self._trim(start, end))
-        return spans
-
-    def _trim(self, start: int, end: int) -> tuple[int, int]:
-        while start < end and self.masked[start].isspace():
-            start += 1
-        while end > start and self.masked[end - 1].isspace():
-            end -= 1
-        return start, end
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +76,7 @@ class TestMethodSource:
     start: int
     end: int
     name_start: int
+    name_end: int
     params: MapArgument
     headers: MapArgument
 
@@ -163,7 +87,7 @@ class TestMethodSource:
             The new method as source text.
         """
         query, headers = list(query), list(headers)
-        edits = [(self.name_start, self.name_start + len(self.method_name(text)), new_name)]
+        edits = [(self.name_start, self.name_end, new_name)]
         if query:
             edits.append((self.params.start, self.params.end, self.params.with_pairs(query)))
         if headers:
@@ -174,21 +98,10 @@ class TestMethodSource:
         shift = sum(len(replacement) - (end - start) for start, end, replacement in edits)
         return method[self.start : self.end + shift]
 
-    def method_name(self, text: str) -> str:
-        """Read the method's name back from the file.
-
-        Returns:
-            The name.
-        """
-        return re.match(r"\w+", text[self.name_start :]).group()  # type: ignore[union-attr]
-
 
 class JavaTestFile:
     """One Java file of a suite, with its test methods found by offset."""
 
-    _TEST_METHOD = re.compile(
-        r"@Test\b(?:\s*\([^)]*\))?\s*(?:@\w+(?:\s*\([^)]*\))?\s*)*public\s+(?:final\s+)?void\s+(?P<name>\w+)\s*\("
-    )
     _HELPER = re.compile(r"(?<![\w.])(?:get|post|put|patch|delete)\s*\(")
 
     def __init__(self, path: Path) -> None:
@@ -203,7 +116,7 @@ class JavaTestFile:
             The method, or None when it is missing, sends more than one helper call, or its maps aren't literal.
         """
         masked = self.source.masked
-        match = next((m for m in self._TEST_METHOD.finditer(masked) if m.group("name") == name), None)
+        match = next((m for m in JavaSuite.TEST_METHOD.finditer(masked) if m.group("name") == name), None)
         if match is None:
             return None
         body_open = masked.index("{", match.end())
@@ -219,7 +132,8 @@ class JavaTestFile:
         headers = self._map_argument(arguments[2], body)
         if params is None or headers is None:
             return None
-        return TestMethodSource(self.path, match.start(), body_close + 1, match.start("name"), params, headers)
+        name_span = match.span("name")
+        return TestMethodSource(self.path, match.start(), body_close + 1, *name_span, params, headers)
 
     def with_methods(self, methods: Iterable[str]) -> str:
         """Add methods to the end of the class.
@@ -316,23 +230,6 @@ class MergedTest:
             "round": self.round,
         }
 
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> Self:
-        """Read a merge saved by `to_dict`.
-
-        Returns:
-            The merge.
-        """
-        return cls(
-            JavaTest.from_id(raw["test"]),
-            GroupKey(*raw["key"]),
-            JavaTest.from_id(raw["base"]),
-            [JavaTest.from_id(donor) for donor in raw["donors"]],
-            [MapPair(*pair) for pair in raw["query"]],
-            [MapPair(*pair) for pair in raw["headers"]],
-            raw["round"],
-        )
-
 
 @dataclass(slots=True)
 class MergeGroup:
@@ -375,9 +272,14 @@ class MergePlanner:
     """Finds the merge groups of a recording and writes the merged copies into the Java sources."""
 
     def __init__(self, records: list[RecordedTest], api: ApiDescription, source_root: Path) -> None:
-        """Group every test that sent exactly one request that matched an operation and whose source is editable."""
+        """Group every test that sent exactly one request that matched an operation and whose source is editable.
+
+        `skipped` keeps every other one-request test with the reason, so "nothing to merge" can be told apart from
+        "couldn't read the method".
+        """
         self._source_root = source_root
         self._files: dict[Path, JavaTestFile] = {}
+        self.skipped: list[tuple[JavaTest, str]] = []
         groups: dict[GroupKey, MergeGroup] = {}
         for record in records:
             member = self._member(record, api)
@@ -458,9 +360,15 @@ class MergePlanner:
         exchange = record.exchanges[0]
         operation = api.match(exchange.request.method, exchange.request.target)
         if operation is None:
+            self.skipped.append((record.test, "its request matched no documented operation"))
             return None
-        source = self._source_of(record.test)
+        path = self._source_root / Path(*record.test.class_name.split(".")).with_suffix(".java")
+        if not path.exists():
+            self.skipped.append((record.test, "its class has no source file"))
+            return None
+        source = self._file(path).method(record.test.method)
         if source is None:
+            self.skipped.append((record.test, "its method isn't one helper call with literal maps"))
             return None
         key = GroupKey(
             operation.name,
@@ -468,33 +376,39 @@ class MergePlanner:
             MediaType.of(exchange.request.headers.get("Content-Type")),
             MediaType.of(exchange.response.headers.get("Content-Type")),
         )
-        query, headers = self._sent_names(operation, exchange)
+
+        # A test can write a parameter into its path string instead of its map, so the names come from the request.
+        sent = api.values([exchange])
+        query = frozenset(item.name for item in sent if item.location == "query")
+        headers = frozenset(item.name for item in sent if item.location == "header")
         return MergeMember(record.test, key, source, query, headers)
 
-    @staticmethod
-    def _sent_names(operation: Operation, exchange: Exchange) -> tuple[frozenset[str], frozenset[str]]:
-        """The documented names the recorded request really sent, wherever the test put them.
-
-        A test can write a parameter into its path string instead of its map, so the source alone can miss one.
-
-        Returns:
-            The query names and the lower case header names.
-        """
-        query = frozenset(
-            name for name, _ in parse_qsl(urlsplit(exchange.request.target).query) if operation.documents("query", name)
-        )
-        headers = frozenset(
-            name.lower() for name, _ in exchange.request.headers.pairs if operation.documents("header", name)
-        )
-        return query, headers
-
-    def _source_of(self, test: JavaTest) -> TestMethodSource | None:
-        path = self._source_root / Path(*test.class_name.split(".")).with_suffix(".java")
-        if not path.exists():
-            return None
+    def _file(self, path: Path) -> JavaTestFile:
         if path not in self._files:
             self._files[path] = JavaTestFile(path)
-        return self._files[path].method(test.method)
+        return self._files[path]
+
+    @staticmethod
+    def check_matching(records: list[RecordedTest], api: ApiDescription, coverage: SuiteCoverage) -> None:
+        """Stop when the tool and RESTCov put a one-request test under different operations.
+
+        The groups and the live check use the tool's own matching, so it has to agree with what RESTCov counted.
+
+        Raises:
+            ValueError: If they disagree on any test.
+        """
+        wrong = []
+        for record in records:
+            if len(record.exchanges) != 1:
+                continue
+            request = record.exchanges[0].request
+            operation = api.match(request.method, request.target)
+            ours = {operation.name} if operation else set()
+            items = coverage.per_test.get(record.test, CoverageSet()).items
+            if ours != {item.key for item in items if item.criterion is Criterion.OPERATION}:
+                wrong.append(record.test.id)
+        if wrong:
+            raise ValueError(f"The tool and RESTCov match {len(wrong)} tests to other operations, such as {wrong[0]}")
 
 
 class MediaType:

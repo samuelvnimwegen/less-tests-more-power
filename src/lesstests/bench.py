@@ -52,7 +52,6 @@ class BenchRun:
     round: int
     position: int
     seconds: float
-    test_seconds: float
     outcomes: dict[str, int]
     requests: int
     errors: int
@@ -75,7 +74,6 @@ class BenchRun:
             "round": self.round,
             "position": self.position,
             "seconds": round(self.seconds, 3),
-            "test_seconds": round(self.test_seconds, 3),
             "outcomes": self.outcomes,
             "requests": self.requests,
             "errors": self.errors,
@@ -95,7 +93,6 @@ class BenchRun:
             raw["round"],
             raw["position"],
             raw["seconds"],
-            raw["test_seconds"],
             dict(raw["outcomes"]),
             raw["requests"],
             raw["errors"],
@@ -147,7 +144,7 @@ class Benchmark:
                     self._once(self._plan.original, -number, 0, out)
                 for number in range(1, rounds + 1):
                     for position, version in enumerate(self._order(number), start=1):
-                        saved = out / "runs" / f"round-{number}-{self._slug(version.name)}.json"
+                        saved = out / "runs" / f"{self._name(version, number)}.json"
                         if saved.exists():
                             run = BenchRun.from_dict(json.loads(saved.read_text(encoding="utf-8")))
                         else:
@@ -180,7 +177,7 @@ class Benchmark:
         for attempt in range(1, self.ATTEMPTS):
             if run.started:
                 break
-            name = f"round-{number}-{self._slug(version.name)}"
+            name = self._name(version, number)
             failed = out / "runs" / "failed" / f"{name}-attempt-{attempt}.json"
             failed.parent.mkdir(parents=True, exist_ok=True)
             failed.write_text(json.dumps(run.to_dict(), indent=1), encoding="utf-8")
@@ -200,7 +197,7 @@ class Benchmark:
 
         # A late answer from the previous run must not end up in this one.
         self._log.take()
-        name = f"warmup-{-number}" if number < 0 else f"round-{number}-{self._slug(version.name)}"
+        name = self._name(version, number)
         result = self._runner.run_suite(version.tests, f"testng/{name}")
         exchanges, errors = self._log.take()
         logs = RestCovLogFolder(out / "logs" / name).write(exchanges)
@@ -210,7 +207,6 @@ class Benchmark:
             number,
             position,
             result.seconds,
-            result.test_seconds,
             dict(Counter(outcome.value for outcome in result.outcomes.values())),
             len(exchanges),
             len(errors),
@@ -219,8 +215,15 @@ class Benchmark:
         )
 
     @staticmethod
-    def _slug(name: str) -> str:
-        return name.lower().replace(" + ", "-").replace(" ", "-")
+    def _name(version: SuiteVersion, number: int) -> str:
+        """Name a run the same way for its saved record, its logs and its TestNG folder. Warmups count down from -1.
+
+        Returns:
+            A name like `round-3-select-merge` or `warmup-1`.
+        """
+        if number < 0:
+            return f"warmup-{-number}"
+        return f"round-{number}-{version.name.lower().replace(' + ', '-').replace(' ', '-')}"
 
 
 class BenchReport:

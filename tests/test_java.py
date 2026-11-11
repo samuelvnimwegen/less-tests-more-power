@@ -219,7 +219,6 @@ def test_run_suite_runs_every_test_in_one_jvm_from_a_suite_file(
     assert command[-1] == str(tmp_path / "out" / "round-1-original" / "suite.xml")
     assert env is not None and env["T"] == "1"
     assert run.outcomes == {tests[0]: Outcome.PASSED, tests[1]: Outcome.FAILED, tests[2]: Outcome.ERROR}
-    assert run.test_seconds == 1.0
     assert run.seconds >= 0
     assert (tmp_path / "out" / "round-1-original" / "console.log").read_text() == "out"
 
@@ -257,7 +256,6 @@ def test_run_suite_counts_every_test_as_an_error_when_the_jvm_hangs(
     tests = [JavaTest("a.B", "c")]
     run = JvmRunner(_project(tmp_path), tmp_path / "out").run_suite(tests, "r", timeout=1)
     assert run.outcomes == {tests[0]: Outcome.ERROR}
-    assert run.test_seconds == 0.0
 
 
 def test_suite_xml_lists_each_method_under_its_class() -> None:

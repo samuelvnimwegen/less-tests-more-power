@@ -7,15 +7,13 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol, Self, cast
+from typing import Self, cast
 
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
-from lesstests.java import JvmSettings
+from lesstests.java import JvmSettings, MavenProject
 from lesstests.tls import CertificateAuthority
 
 HOP_BY_HOP = ("connection", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade")
-
-LISTENER = "lesstests.LesstestsProxyListener"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,50 +22,6 @@ class Address:
 
     host: str
     port: int
-
-
-class Upstream(Protocol):
-    """Where a proxy sends the requests it gets."""
-
-    def open(self) -> http.client.HTTPConnection:
-        """Open a fresh connection.
-
-        Returns:
-            The connection, not yet connected.
-        """
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class PlainUpstream:
-    """A service that speaks plain HTTP, like a local container."""
-
-    address: Address
-
-    def open(self) -> http.client.HTTPConnection:
-        """Open a plain HTTP connection.
-
-        Returns:
-            The connection.
-        """
-        return http.client.HTTPConnection(self.address.host, self.address.port, timeout=60)
-
-
-@dataclass(frozen=True, slots=True)
-class TlsUpstream:
-    """A real HTTPS host, checked against the given context."""
-
-    host: str
-    port: int
-    context: ssl.SSLContext
-
-    def open(self) -> http.client.HTTPConnection:
-        """Open a TLS connection.
-
-        Returns:
-            The connection.
-        """
-        return http.client.HTTPSConnection(self.host, self.port, timeout=60, context=self.context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,16 +124,17 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
         """Store one finished exchange."""
         self._proxy.log.add(exchange)
 
-    def _upstream(self) -> Upstream:
-        """Pick where the request goes.
+    def _connect(self) -> http.client.HTTPConnection:
+        """Open a fresh connection to where the request goes.
 
         Returns:
-            The upstream.
+            The connection, not yet connected.
         """
-        return PlainUpstream(cast("_ProxyServer", self.server).upstream)
+        upstream = cast("_ProxyServer", self.server).upstream
+        return http.client.HTTPConnection(upstream.host, upstream.port, timeout=60)
 
     def _send_upstream(self, request: HttpRequest) -> HttpResponse:
-        connection = self._upstream().open()
+        connection = self._connect()
         try:
             return self._talk(connection, request)
         finally:
@@ -288,8 +243,9 @@ class _TunnelHandler(_ForwardingHandler):
         if self._host.lower() not in self._intercepting.passthrough:
             self._proxy.log.add(self._intercepting.redactor.apply(exchange))
 
-    def _upstream(self) -> Upstream:
-        return TlsUpstream(self._host, self._port, self._intercepting.upstream_context)
+    def _connect(self) -> http.client.HTTPConnection:
+        context = self._intercepting.upstream_context
+        return http.client.HTTPSConnection(self._host, self._port, timeout=60, context=context)
 
     def _send_upstream(self, request: HttpRequest) -> HttpResponse:
         """Reuse one upstream connection per tunnel, so every request doesn't pay for a new TLS handshake.
@@ -304,7 +260,7 @@ class _TunnelHandler(_ForwardingHandler):
         """
         reused = self._open is not None
         if self._open is None:
-            self._open = self._upstream().open()
+            self._open = self._connect()
         try:
             return self._talk(self._open, request)
         except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
@@ -314,7 +270,7 @@ class _TunnelHandler(_ForwardingHandler):
                 raise
 
             # The host closed an idle connection before reading the request, so one fresh try is safe.
-            self._open = self._upstream().open()
+            self._open = self._connect()
             return self._talk(self._open, request)
 
     @staticmethod
@@ -481,22 +437,23 @@ class InterceptingProxy(Proxy):
     """A forward proxy for HTTPS that reads inside each tunnel, for tests that call a live API by its real name.
 
     The tests trust a private CA, so the proxy can show them its own certificate for any host. Requests to a
-    `passthrough` host are forwarded but never logged, and `redact` headers are hidden in the log.
+    `passthrough` host are forwarded but never logged, and the `REDACTED_HEADERS` are hidden in the log.
     """
+
+    REDACTED_HEADERS = frozenset({"authorization", "cookie", "set-cookie"})
 
     def __init__(
         self,
         listen: Address,
         authority: CertificateAuthority,
         passthrough: frozenset[str] = frozenset(),
-        redact: tuple[str, ...] = ("authorization", "cookie", "set-cookie"),
         upstream_context: ssl.SSLContext | None = None,
     ) -> None:
         """Set up the proxy without opening the port yet."""
         super().__init__(listen)
         self._authority = authority
         self._passthrough = frozenset(host.lower() for host in passthrough)
-        self._redactor = Redactor(frozenset(name.lower() for name in redact))
+        self._redactor = Redactor(self.REDACTED_HEADERS)
         self._upstream_context = upstream_context or ssl.create_default_context()
 
     def _make_server(self) -> _LoggingServer:
@@ -519,5 +476,5 @@ class InterceptingProxy(Proxy):
                 "lesstests.truststore": str(truststore),
                 "lesstests.truststore.password": password,
             },
-            listeners=(LISTENER,),
+            listeners=(MavenProject.LISTENER,),
         )

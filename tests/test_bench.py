@@ -37,7 +37,7 @@ class FakeRunner:
         for test in tests:
             request = HttpRequest("GET", f"/files?corpora={test.method}", Headers(), Body())
             self.log.pending.append(Exchange(request, HttpResponse(200, "OK", Headers(), Body())))
-        return SuiteRun(dict.fromkeys(tests, Outcome.PASSED), float(len(tests)), float(len(tests)) / 2)
+        return SuiteRun(dict.fromkeys(tests, Outcome.PASSED), float(len(tests)))
 
 
 class FakeService:
@@ -113,7 +113,7 @@ class FlakyRunner(FakeRunner):
         if len(tests) == 4 and not self.failed:
             self.failed = True
             self.order.append(0)
-            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), 40.0, 0.0)
+            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), 40.0)
         return super().run_suite(tests, name)
 
 
