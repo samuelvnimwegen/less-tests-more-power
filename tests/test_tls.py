@@ -17,6 +17,14 @@ def test_the_ca_is_made_once_and_then_reused(tmp_path: Path) -> None:
     assert x509.load_pem_x509_certificate(pem).extensions.get_extension_for_class(x509.BasicConstraints).value.ca
 
 
+def test_every_private_key_is_readable_by_its_owner_only(tmp_path: Path) -> None:
+    authority = CertificateAuthority.load_or_create(tmp_path / "ca")
+    authority.server_context("www.googleapis.com")
+    keys = sorted((tmp_path / "ca").rglob("*key.pem"))
+    assert len(keys) == 2
+    assert {key.stat().st_mode & 0o777 for key in keys} == {0o600}
+
+
 def test_a_host_certificate_names_the_host_and_is_cached(tmp_path: Path) -> None:
     authority = CertificateAuthority.load_or_create(tmp_path)
     context = authority.server_context("www.googleapis.com")

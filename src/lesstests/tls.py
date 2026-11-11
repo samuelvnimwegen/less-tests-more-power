@@ -2,6 +2,7 @@
 
 import datetime
 import ipaddress
+import os
 import shutil
 import ssl
 import subprocess
@@ -76,12 +77,7 @@ class CertificateAuthority:
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
             .sign(key, hashes.SHA256())
         )
-        key_path.write_bytes(
-            key.private_bytes(
-                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-            )
-        )
-        key_path.chmod(0o600)
+        cls._write_key(key_path, key)
         cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         return cls(folder, key, cert)
 
@@ -160,15 +156,23 @@ class CertificateAuthority:
         cert_path, key_path = hosts / f"{host}-cert.pem", hosts / f"{host}-key.pem"
         chain = cert.public_bytes(serialization.Encoding.PEM) + self._cert.public_bytes(serialization.Encoding.PEM)
         cert_path.write_bytes(chain)
-        key_path.write_bytes(
-            key.private_bytes(
-                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-            )
-        )
-        key_path.chmod(0o600)
+        self._write_key(key_path, key)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert_path, key_path)
         return context
+
+    @staticmethod
+    def _write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
+        """Write a private key that only the owner can read, from the first byte on."""
+        data = key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+        # The mode of `os.open` only counts for a new file, so an old one gets it here.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
 
     @staticmethod
     def _alt_name(host: str) -> x509.GeneralName:
