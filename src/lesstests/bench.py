@@ -57,11 +57,16 @@ class BenchRun:
     errors: int
     coverage: CoverageSet
     values: frozenset[ValueItem]
+    finished: bool = True
 
     @property
     def started(self) -> bool:
-        """Whether the suite really ran. A JVM that dies before the first test leaves only errors and no request."""
-        return self.requests > 0 or set(self.outcomes) != {"error"}
+        """Whether the suite really ran to its end.
+
+        A JVM that dies before the first test leaves only errors and no request. A JVM that hit the suite timeout
+        sent requests but has no outcomes, so it doesn't count either.
+        """
+        return self.finished and (self.requests > 0 or set(self.outcomes) != {"error"})
 
     def to_dict(self) -> dict[str, Any]:
         """Turn the run into JSON friendly data.
@@ -79,6 +84,7 @@ class BenchRun:
             "errors": self.errors,
             "coverage": self.coverage.to_list(),
             "values": [value.to_list() for value in sorted(self.values)],
+            "finished": self.finished,
         }
 
     @classmethod
@@ -98,6 +104,7 @@ class BenchRun:
             raw["errors"],
             CoverageSet.from_list(raw["coverage"]),
             frozenset(ValueItem.from_list(value) for value in raw["values"]),
+            raw.get("finished", True),
         )
 
 
@@ -146,9 +153,14 @@ class Benchmark:
                 for number in range(1, rounds + 1):
                     for position, version in enumerate(self._order(number), start=1):
                         saved = out / "runs" / f"{self._name(version, number)}.json"
-                        if saved.exists():
-                            run = BenchRun.from_dict(json.loads(saved.read_text(encoding="utf-8")))
-                        else:
+                        run = (
+                            BenchRun.from_dict(json.loads(saved.read_text(encoding="utf-8")))
+                            if saved.exists()
+                            else None
+                        )
+
+                        # A saved run that never started gets another go, or the report would refuse it forever.
+                        if run is None or not run.started:
                             run = self._started(version, number, position, out)
                             saved.parent.mkdir(parents=True, exist_ok=True)
                             saved.write_text(json.dumps(run.to_dict(), indent=1), encoding="utf-8")
@@ -226,6 +238,7 @@ class Benchmark:
             len(errors),
             coverage,
             self._api.values(exchanges),
+            result.finished,
         )
 
     @staticmethod
@@ -311,14 +324,16 @@ class BenchReport:
     def _significance(self, rounds: list[int]) -> list[str]:
         """Test with the paired Wilcoxon signed rank test whether a version is faster than another.
 
-        Every smaller version faces the Original, and Select + Merge also faces Select, since that pair shows what
-        merging adds on top of dropping tests.
+        Every smaller version faces the Original, and Select + Merge also faces Select when the plan has it, since
+        that pair shows what merging adds on top of dropping tests.
 
         Returns:
             One line per pair.
         """
-        pairs = [(version.name, VersionPlan.ORIGINAL) for version in self._plan.versions[1:]]
-        pairs.append((VersionPlan.SELECT_MERGE, VersionPlan.SELECT))
+        names = [version.name for version in self._plan.versions]
+        pairs = [(name, VersionPlan.ORIGINAL) for name in names[1:]]
+        if VersionPlan.SELECT_MERGE in names:
+            pairs.append((VersionPlan.SELECT_MERGE, VersionPlan.SELECT))
         return [self._compare(faster, slower, rounds) for faster, slower in pairs]
 
     def _compare(self, version: str, other: str, rounds: list[int]) -> str:

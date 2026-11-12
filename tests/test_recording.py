@@ -9,7 +9,7 @@ import pytest
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
 from lesstests.java import JavaSuite, JavaTest, JvmRunner, MavenProject, Outcome, RunResult
 from lesstests.proxy import Address, RecordingProxy
-from lesstests.recording import RecordedTest, Recorder, Recording
+from lesstests.recording import EveryClass, EveryTest, RecordedTest, Recorder, Recording
 
 SUITE = """package suite;
 
@@ -210,3 +210,63 @@ def test_a_resume_ignores_the_facts_every_run_writes_itself(tmp_path: Path) -> N
     recording.check_resume({"suite": "single-agent", "tests": 7, "started": "17:00", "finished": "17:30"}, [])
     with pytest.raises(ValueError, match="another suite"):
         recording.check_resume({"suite": "multi-agent", "tests": 1}, [])
+
+
+class ListedSuite:
+    def __init__(self, tests: list[JavaTest]) -> None:
+        self._tests = tests
+
+    def tests(self) -> list[JavaTest]:
+        return sorted(self._tests)
+
+
+def _two_classes() -> ListedSuite:
+    return ListedSuite([JavaTest("s.A", "a1"), JavaTest("s.A", "a2"), JavaTest("s.B", "b1"), JavaTest("s.B", "b2")])
+
+
+def test_a_per_class_reset_only_comes_before_the_first_test_of_each_class(tmp_path: Path, upstream: Address) -> None:
+    recording = Recording(tmp_path / "rec")
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    runner = FakeRunner(tmp_path, proxy, service.calls)
+    Recorder(_two_classes(), runner, service, proxy, recording, EveryClass()).run({"suite": "x"})
+
+    assert service.calls == ["start", "reset", "run a1", "run a2", "reset", "run b1", "run b2", "stop"]
+    assert recording.meta()["reset"] == "every class"
+
+
+def test_a_resume_records_a_half_done_class_again_from_its_first_test(tmp_path: Path, upstream: Address) -> None:
+    recording = Recording(tmp_path / "rec")
+    recording.save(RecordedTest(JavaTest("s.A", "a1"), Outcome.PASSED, 1.0))
+    recording.save(RecordedTest(JavaTest("s.B", "b1"), Outcome.FAILED, 1.0))
+    recording.save(RecordedTest(JavaTest("s.B", "b2"), Outcome.FAILED, 1.0))
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    runner = FakeRunner(tmp_path, proxy, service.calls)
+    Recorder(_two_classes(), runner, service, proxy, recording, EveryClass()).run({})
+
+    # Class A stopped after a1, so a2 alone would miss what a1 left behind. Class B was done and stays.
+    assert service.calls == ["start", "reset", "run a1", "run a2", "stop"]
+    assert {record.test.method: record.outcome for record in recording.records()}["b1"] is Outcome.FAILED
+
+
+def test_the_default_reset_policy_adds_no_fact_so_older_recordings_still_resume(tmp_path: Path) -> None:
+    assert EveryTest().facts() == {}
+    assert EveryTest().redo({JavaTest("s.A", "a1")}, _two_classes().tests()) == set()
+    assert EveryClass().due(JavaTest("s.A", "a1"), JavaTest("s.A", "a2")) is False
+    assert EveryClass().due(None, JavaTest("s.A", "a2")) is True
+
+
+def test_the_recorder_keeps_the_suites_order(tmp_path: Path, upstream: Address) -> None:
+    class OrderedSuite:
+        def tests(self) -> list[JavaTest]:
+            return [JavaTest("s.B", "second"), JavaTest("s.B", "first"), JavaTest("s.A", "a1")]
+
+    recording = Recording(tmp_path / "rec")
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    runner = FakeRunner(tmp_path, proxy, service.calls)
+    Recorder(OrderedSuite(), runner, service, proxy, recording, EveryClass()).run({})
+
+    # JUnit runs `second` before `first` here, for example through @Order, and the recording follows it.
+    assert service.calls == ["start", "reset", "run second", "run first", "reset", "run a1", "stop"]
