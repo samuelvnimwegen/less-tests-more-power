@@ -153,9 +153,14 @@ class Benchmark:
                 for number in range(1, rounds + 1):
                     for position, version in enumerate(self._order(number), start=1):
                         saved = out / "runs" / f"{self._name(version, number)}.json"
-                        if saved.exists():
-                            run = BenchRun.from_dict(json.loads(saved.read_text(encoding="utf-8")))
-                        else:
+                        run = (
+                            BenchRun.from_dict(json.loads(saved.read_text(encoding="utf-8")))
+                            if saved.exists()
+                            else None
+                        )
+
+                        # A saved run that never started gets another go, or the report would refuse it forever.
+                        if run is None or not run.started:
                             run = self._started(version, number, position, out)
                             saved.parent.mkdir(parents=True, exist_ok=True)
                             saved.write_text(json.dumps(run.to_dict(), indent=1), encoding="utf-8")

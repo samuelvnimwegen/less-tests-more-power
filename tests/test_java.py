@@ -263,7 +263,7 @@ def test_run_suite_counts_every_test_as_an_error_when_the_jvm_hangs(
 
     monkeypatch.setattr(subprocess, "run", hang)
     tests = [JavaTest("a.B", "c")]
-    run = JvmRunner(_project(tmp_path), tmp_path / "out").run_suite(tests, "r", timeout=1)
+    run = JvmRunner(_project(tmp_path), tmp_path / "out", suite_timeout=1).run_suite(tests, "r")
     assert run.outcomes == {tests[0]: Outcome.ERROR}
     assert not run.finished
 

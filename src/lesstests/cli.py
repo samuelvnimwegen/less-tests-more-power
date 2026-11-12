@@ -8,13 +8,11 @@ from typing import Any, Protocol
 from lesstests.api import ApiDescription
 from lesstests.bench import Benchmark, BenchReport, BenchRun
 from lesstests.coverage import RestCov, SuiteCoverage
-from lesstests.java import BuiltProject, JvmRunner, JvmSettings
-from lesstests.merge_study import MergeFolder, MergeStudy
+from lesstests.merge_study import MergeFolder, MergeStudy, PlanStudy
 from lesstests.recording import RecordedTest, Recorder, Recording
 from lesstests.selection import Budget
 from lesstests.study import SelectionStudy
-from lesstests.subjects import SUBJECTS, Subject, SuiteCatalog
-from lesstests.versions import VersionPlanner
+from lesstests.subjects import SUBJECTS, Runners, SuiteCatalog
 
 
 class Command(Protocol):
@@ -125,7 +123,7 @@ class RecordCommand:
         subject = SUBJECTS[args.subject]
         project = args.project.resolve()
         recording = Recording(args.out.resolve())
-        built = subject.toolchain.project(project, recording.folder / "project", subject.overlays(project, args.suite))
+        built = subject.toolchain.project(project, recording.project_folder, subject.overlays(project, args.suite))
         print(f"Compiling a copy of {project} ...", flush=True)
         built.prepare()
         connection = subject.connect(EnvFile.read(args.env_file))
@@ -148,21 +146,6 @@ class RecordCommand:
             tests = [test for test in suite.tests() if pattern.search(test.id)]
             meta["only"] = args.only
         recorder.run(meta, Progress.recorded, tests)
-
-
-class Runners:
-    """Builds the test runner a subject needs, with its framework and its timeouts."""
-
-    @staticmethod
-    def of(subject: Subject, project: BuiltProject, output: Path, settings: JvmSettings) -> JvmRunner:
-        """Build the runner.
-
-        Returns:
-            The runner.
-        """
-        timeouts = subject.timeouts
-        launcher = subject.toolchain.launcher()
-        return JvmRunner(project, output, timeouts.test, settings, launcher, timeouts.suite)
 
 
 class RecordingCommand:
@@ -243,14 +226,8 @@ class MergeCommand(RecordingCommand):
         EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        """Run the Merge step and print the plan.
-
-        Raises:
-            SystemExit: If the subject's tests are not ones Merge can rewrite.
-        """
+        """Run the Merge step and print the plan."""
         recording = Recording(args.recording.resolve())
-        if not SUBJECTS[recording.meta()["subject"]].toolchain.mergeable:
-            raise SystemExit("Merge only rewrites TestNG suites. Use `lesstests plan` for Original and Select")
         restcov = RestCovOption.restcov(args, recording.meta())
         coverage = self.coverage(recording, restcov)
         study = MergeStudy(recording, restcov, coverage, EnvFile.read(args.env_file), args.rounds, Progress.recorded)
@@ -271,17 +248,8 @@ class PlanCommand(RecordingCommand):
     def run(self, args: argparse.Namespace) -> None:
         """Pick Select's tests and write the folder the benchmark reads."""
         recording = Recording(args.recording.resolve())
-        meta = recording.meta()
-        restcov = RestCovOption.restcov(args, meta)
-        coverage = self.coverage(recording, restcov)
-        api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
-        records = recording.records()
-        plan = VersionPlanner(api, (coverage, records), merge_step=False).plan()
-        folder = MergeFolder(args.out.resolve())
-        folder.save_meta({**meta, "recording": str(recording.folder), "copy": str(recording.folder / "project")})
-        single = sum(record.requests == 1 for record in records)
-        folder.save_plan(plan, f"{single} of {len(records)} tests sent exactly one request.")
-        print((folder.folder / "plan.md").read_text(encoding="utf-8"))
+        coverage = self.coverage(recording, RestCovOption.restcov(args, recording.meta()))
+        print(PlanStudy(recording, coverage).run(args.out.resolve()))
 
 
 class BenchCommand:

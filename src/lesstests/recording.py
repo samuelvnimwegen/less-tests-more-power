@@ -93,6 +93,11 @@ class Recording:
         self.folder = folder
 
     @property
+    def project_folder(self) -> Path:
+        """Where Record keeps its compiled copy of the project."""
+        return self.folder / "project"
+
+    @property
     def tests_folder(self) -> Path:
         """Where the JSON records live."""
         return self.folder / "tests"
@@ -318,7 +323,8 @@ class Recorder:
 
         `tests` limits the run to some tests, such as the merged copies of one merge round.
         """
-        tests = self._suite.tests() if tests is None else sorted(tests)
+        # The suite's order stays, since JUnit's order keeps @Order and the tests of a class together.
+        tests = list(self._suite.tests() if tests is None else tests)
         meta = {**meta, **self._reset.facts()}
         self._recording.check_resume(meta, tests)
         started = datetime.now(UTC).isoformat(timespec="seconds")

@@ -7,10 +7,10 @@ from typing import Any
 
 from lesstests.api import ApiDescription
 from lesstests.coverage import RestCov, SuiteCoverage
-from lesstests.java import BuiltProject, JavaTest, JvmRunner, Overlay
+from lesstests.java import BuiltProject, JavaTest, Overlay
 from lesstests.merge import MergedTest, MergeOutcome, MergePlanner, Merger
 from lesstests.recording import RecordedTest, Recorder, Recording
-from lesstests.subjects import SUBJECTS, Subject
+from lesstests.subjects import SUBJECTS, Runners, Subject
 from lesstests.versions import VersionPlan, VersionPlanner
 
 Progress = Callable[[int, int, RecordedTest], None]
@@ -53,9 +53,7 @@ class MergeRoundRunner:
         built = self.project(edited, folder)
         connection = self._subject.connect(self._env)
         recording = Recording(folder / "recording")
-        timeouts = self._subject.timeouts
-        launcher = self._subject.toolchain.launcher()
-        runner = JvmRunner(built, folder / "testng", timeouts.test, connection.settings, launcher, timeouts.suite)
+        runner = Runners.of(self._subject, built, folder / "testng", connection.settings)
         suite = self._subject.toolchain.suite(built, self._meta["package"], connection.settings)
         recorder = Recorder(suite, runner, connection.service, connection.proxy, recording, self._subject.reset_policy)
         recorder.run(self._meta, self._progress, [merge.test for merge in merged])
@@ -76,7 +74,8 @@ class MergeFolder:
     def project(self) -> Path:
         """The compiled copy every benchmark run starts from.
 
-        Merge compiles its own copy with every kept merge. `plan` reuses the recording's copy, and names it.
+        Merge compiles its own copy with every kept merge. `plan` reuses the recording's copy and names it as
+        `copy`, so the folder never gets a second copy of a project as big as Fineract.
         """
         copy = self.meta().get("copy")
         return Path(copy) if copy else self.folder / "project"
@@ -96,6 +95,15 @@ class MergeFolder:
             The plan.
         """
         return VersionPlan.load(self.folder / "plan.json")
+
+    def check_outside(self, recording: Recording) -> None:
+        """Refuse a folder inside the recording, since its files would land among the recording's own.
+
+        Raises:
+            ValueError: If the folder sits inside the recording.
+        """
+        if self.folder.resolve().is_relative_to(recording.folder.resolve()):
+            raise ValueError(f"--out {self.folder} sits inside the recording {recording.folder}. Pick another --out")
 
     def save_meta(self, meta: dict[str, Any]) -> None:
         """Write the facts."""
@@ -146,18 +154,20 @@ class MergeStudy:
             The plan with Original, Select and Select + Merge.
 
         Raises:
-            ValueError: If `out` sits inside the recording, whose project copy is the source of every merge.
+            ValueError: If the subject's tests are not ones Merge can rewrite.
         """
-        if out.resolve().is_relative_to(self._recording.folder.resolve()):
-            raise ValueError(f"--out {out} sits inside the recording, whose project copy is the merge source")
+        folder = MergeFolder(out)
+        folder.check_outside(self._recording)
         meta = self._recording.meta()
+        subject = SUBJECTS[meta["subject"]]
+        if not subject.toolchain.mergeable:
+            raise ValueError(f"Merge only rewrites TestNG suites, not {subject.name}. Use `lesstests plan`")
         api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
         records = self._recording.records()
         MergePlanner.check_matching(records, api, self._coverage)
-        runner = MergeRoundRunner(SUBJECTS[meta["subject"]], meta, self._env, self._progress)
-        planner = MergePlanner(records, api, self._recording.folder / "project" / "src" / "test" / "java")
+        runner = MergeRoundRunner(subject, meta, self._env, self._progress)
+        planner = MergePlanner(records, api, self._recording.project_folder / "src" / "test" / "java")
         outcome = Merger(planner, runner, api, self._rounds).run(out / "rounds")
-        folder = MergeFolder(out)
         folder.save({**meta, "recording": str(self._recording.folder)}, outcome, planner.skipped)
 
         print(f"Compiling the final project with {len(outcome.accepted)} merged tests ...", flush=True)
@@ -170,6 +180,34 @@ class MergeStudy:
             merged.write_meta(meta)
             merged_records = merged.records()
             merged_part = (SuiteCoverage.measure(merged, self._restcov, merged.folder / "coverage"), merged_records)
-        plan = VersionPlanner(api, (self._coverage, records), merged_part).plan()
+        plan = VersionPlanner(api, (self._coverage, records)).plan_with_merge(merged_part)
         folder.save_plan(plan)
         return plan
+
+
+class PlanStudy:
+    """Plans Original and Select from a recording without Merge, for a suite Merge can't rewrite, like Fineract."""
+
+    def __init__(self, recording: Recording, coverage: SuiteCoverage) -> None:
+        """Keep the recording with its coverage."""
+        self._recording = recording
+        self._coverage = coverage
+
+    def run(self, out: Path) -> str:
+        """Write the folder the benchmark reads. It names the recording's copy, so nothing gets built again.
+
+        Returns:
+            What the recordings predict, as Markdown.
+        """
+        folder = MergeFolder(out)
+        folder.check_outside(self._recording)
+        meta = self._recording.meta()
+        api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
+        records = self._recording.records()
+        plan = VersionPlanner(api, (self._coverage, records)).plan()
+        recording = str(self._recording.folder)
+        folder.save_meta({**meta, "recording": recording, "copy": str(self._recording.project_folder)})
+        single = sum(record.requests == 1 for record in records)
+        note = f"{single} of {len(records)} tests sent exactly one request."
+        folder.save_plan(plan, note)
+        return (folder.folder / "plan.md").read_text(encoding="utf-8")

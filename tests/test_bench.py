@@ -186,3 +186,26 @@ def test_a_run_that_hit_the_suite_timeout_is_repeated_instead_of_counted(tmp_pat
     assert Benchmark.repeated(tmp_path / "bench") == 1
     failed = json.loads(next((tmp_path / "bench" / "runs" / "failed").glob("*.json")).read_text())
     assert (failed["requests"], failed["finished"]) == (4, False)
+
+
+class AlwaysTimeoutRunner(FakeRunner):
+    """Every run hits the suite timeout."""
+
+    def run_suite(self, tests: list[JavaTest], name: str) -> SuiteRun:
+        return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), 1.0, finished=False)
+
+
+def test_a_saved_run_that_never_started_gets_another_go_on_resume(tmp_path: Path) -> None:
+    benchmark, _, _ = _bench(tmp_path)
+    slow = AlwaysTimeoutRunner(FakeLog())
+    benchmark._runner = slow
+    benchmark._log = slow.log
+    first = benchmark.run(tmp_path / "bench", rounds=1, warmup=0)
+    assert not any(run.started for run in first)
+
+    working = FakeRunner(FakeLog())
+    benchmark._runner = working
+    benchmark._log = working.log
+    runs = benchmark.run(tmp_path / "bench", rounds=1, warmup=0)
+    assert all(run.started for run in runs)
+    assert sorted(working.order) == [1, 2, 4]

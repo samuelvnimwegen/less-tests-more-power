@@ -8,6 +8,7 @@ from lesstests.java import (
     JavaSuite,
     JUnitLauncher,
     JUnitSuite,
+    JvmRunner,
     JvmSettings,
     Launcher,
     MavenProject,
@@ -235,6 +236,21 @@ class Subject(Protocol):
         ...
 
 
+class Runners:
+    """Builds the test runner a subject needs, with its framework and its timeouts."""
+
+    @staticmethod
+    def of(subject: "Subject", project: BuiltProject, output: Path, settings: JvmSettings) -> JvmRunner:
+        """Build the runner.
+
+        Returns:
+            The runner.
+        """
+        timeouts = subject.timeouts
+        launcher = subject.toolchain.launcher()
+        return JvmRunner(project, output, timeouts.test, settings, launcher, timeouts.suite)
+
+
 class SuiteCatalog:
     """Looks up a suite of a subject."""
 
@@ -291,7 +307,8 @@ class LocalSubject:
             The connection.
         """
         service = DockerService(self.container, self.service_port, f"lesstests-{self.name}")
-        return Connection(service, RecordingProxy(self.listen, service.address), JvmSettings(env=dict(env)))
+        proxy = RecordingProxy(self.listen, service.address, self.timeouts.request)
+        return Connection(service, proxy, JvmSettings(env=dict(env)))
 
     def meta(self) -> dict[str, Any]:
         """The image the container runs.
@@ -430,7 +447,7 @@ class ServerSubject:
         """
         service = DatabaseService(self.app, self.database, self.service_port, f"lesstests-{self.name}")
         proxy = RecordingProxy(self.listen, service.address, self.timeouts.request)
-        settings = JvmSettings(env={**self.address.env(self.listen), **self.test_env, **env})
+        settings = JvmSettings(env=dict(env), public_env={**self.address.env(self.listen), **self.test_env})
         return Connection(service, proxy, settings)
 
     def meta(self) -> dict[str, Any]:
@@ -475,7 +492,8 @@ GOOGLE_DRIVE = LiveSubject(
     restcov_base_path="/drive/v3",
 )
 
-FINERACT_DATABASE_PASSWORD = "lesstests"
+FINERACT_DATABASE = PostgresSpec("postgres:18.3", ("fineract_tenants", "fineract_default"))
+FINERACT_TENANTS, FINERACT_DEFAULT_TENANT = FINERACT_DATABASE.databases
 FINERACT_JVM_FLAGS = " ".join(
     [
         "-Xmx2G",
@@ -508,17 +526,17 @@ FINERACT = ServerSubject(
             "FINERACT_SERVER_PORT": "8080",
             "FINERACT_SERVER_SSL_ENABLED": "false",
             "FINERACT_HIKARI_DRIVER_SOURCE_CLASS_NAME": "org.postgresql.Driver",
-            "FINERACT_HIKARI_JDBC_URL": f"jdbc:postgresql://{PostgresSpec.HOST}:5432/fineract_tenants",
-            "FINERACT_HIKARI_USERNAME": "postgres",
-            "FINERACT_HIKARI_PASSWORD": FINERACT_DATABASE_PASSWORD,
+            "FINERACT_HIKARI_JDBC_URL": f"jdbc:postgresql://{PostgresSpec.HOST}:5432/{FINERACT_TENANTS}",
+            "FINERACT_HIKARI_USERNAME": FINERACT_DATABASE.user,
+            "FINERACT_HIKARI_PASSWORD": FINERACT_DATABASE.password,
             "FINERACT_DEFAULT_TENANTDB_HOSTNAME": PostgresSpec.HOST,
             "FINERACT_DEFAULT_TENANTDB_PORT": "5432",
-            "FINERACT_DEFAULT_TENANTDB_UID": "postgres",
-            "FINERACT_DEFAULT_TENANTDB_PWD": FINERACT_DATABASE_PASSWORD,
+            "FINERACT_DEFAULT_TENANTDB_UID": FINERACT_DATABASE.user,
+            "FINERACT_DEFAULT_TENANTDB_PWD": FINERACT_DATABASE.password,
             "FINERACT_DEFAULT_TENANTDB_CONN_PARAMS": "",
             "FINERACT_DEFAULT_TENANTDB_TIMEZONE": "Asia/Kolkata",
             "FINERACT_DEFAULT_TENANTDB_IDENTIFIER": "default",
-            "FINERACT_DEFAULT_TENANTDB_NAME": "fineract_default",
+            "FINERACT_DEFAULT_TENANTDB_NAME": FINERACT_DEFAULT_TENANT,
             "FINERACT_DEFAULT_TENANTDB_DESCRIPTION": "Default Demo Tenant",
             "FINERACT_DEFAULT_MASTER_PASSWORD": "fineract",
             "FINERACT_MANAGEMENT_ENDPOINT_WEB_EXPOSURE_INCLUDE": "health,info",
@@ -534,9 +552,7 @@ FINERACT = ServerSubject(
         # Some tests start a WireMock server in the test JVM and let Fineract call it.
         docker_args=("--add-host=host.docker.internal:host-gateway",),
     ),
-    database=PostgresSpec(
-        "postgres:18.3", ("fineract_tenants", "fineract_default"), password=FINERACT_DATABASE_PASSWORD
-    ),
+    database=FINERACT_DATABASE,
     listen=Address("127.0.0.1", 8091),
     service_port=8092,
     spec_file="fineract-provider/build/resources/main/static/fineract.json",

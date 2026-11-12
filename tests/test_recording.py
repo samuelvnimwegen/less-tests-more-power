@@ -255,3 +255,18 @@ def test_the_default_reset_policy_adds_no_fact_so_older_recordings_still_resume(
     assert EveryTest().redo({JavaTest("s.A", "a1")}, _two_classes().tests()) == set()
     assert EveryClass().due(JavaTest("s.A", "a1"), JavaTest("s.A", "a2")) is False
     assert EveryClass().due(None, JavaTest("s.A", "a2")) is True
+
+
+def test_the_recorder_keeps_the_suites_order(tmp_path: Path, upstream: Address) -> None:
+    class OrderedSuite:
+        def tests(self) -> list[JavaTest]:
+            return [JavaTest("s.B", "second"), JavaTest("s.B", "first"), JavaTest("s.A", "a1")]
+
+    recording = Recording(tmp_path / "rec")
+    proxy = RecordingProxy(Address("127.0.0.1", 0), upstream)
+    service = FakeService(upstream, proxy)
+    runner = FakeRunner(tmp_path, proxy, service.calls)
+    Recorder(OrderedSuite(), runner, service, proxy, recording, EveryClass()).run({})
+
+    # JUnit runs `second` before `first` here, for example through @Order, and the recording follows it.
+    assert service.calls == ["start", "reset", "run second", "run first", "reset", "run a1", "stop"]

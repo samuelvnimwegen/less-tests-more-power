@@ -173,3 +173,25 @@ def test_the_init_script_names_the_files_gradle_project_reads() -> None:
 
     # Without the classpath as a dependency, Gradle never builds the jars of the other modules.
     assert "dependsOn 'testClasses', classpath" in script
+
+
+def test_a_moved_gradle_copy_still_finds_its_own_files(tmp_path: Path) -> None:
+    project = GradleProject(tmp_path / "source", tmp_path / "old", ":integration-tests")
+    project.workdir.mkdir()
+    old = str(project.workdir.resolve())
+    (project.workdir / "lesstests-root.txt").write_text(old)
+    (project.workdir / "lesstests-classpath.txt").write_text(f"{old}/integration-tests/build/classes:/m2/x.jar")
+    (project.workdir / "lesstests-test-roots.txt").write_text(f"{old}/integration-tests/build/classes")
+    project.workdir.rename(tmp_path / "new")
+
+    moved = GradleProject(tmp_path / "source", tmp_path / "new", ":integration-tests")
+    new = (tmp_path / "new").resolve()
+    assert moved.classpath == f"{new}/integration-tests/build/classes:/m2/x.jar"
+    assert moved.test_roots == [new / "integration-tests" / "build" / "classes"]
+
+
+def test_junit_discovery_keeps_the_order_junit_runs_the_tests_in(tmp_path: Path) -> None:
+    java = '#!/bin/sh\nprintf "a.Z\\tsecond\\na.Z\\tfirst\\na.A\\tx\\n" > "$6"\n'
+    project = BuiltFake(tmp_path, str(_script(tmp_path / "java", java)))
+    project.run_folder.mkdir()
+    assert [test.method for test in JUnitSuite(project, "a").tests()] == ["second", "first", "x"]

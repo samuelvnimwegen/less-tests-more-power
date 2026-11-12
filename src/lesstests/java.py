@@ -428,12 +428,25 @@ class GradleProject:
         return [line for line in self._written("lesstests-jvm-args.txt").splitlines() if line]
 
     def _written(self, name: str) -> str:
-        return (self.workdir / name).read_text(encoding="utf-8").strip()
+        """Read a file the init script wrote, with its paths moved to where the copy sits now.
+
+        Returns:
+            The text.
+        """
+        text = (self.workdir / name).read_text(encoding="utf-8").strip()
+        root = self.workdir / "lesstests-root.txt"
+        if root.exists():
+            text = text.replace(root.read_text(encoding="utf-8").strip(), str(self.workdir.resolve()))
+        return text
 
 
 @dataclass(frozen=True, slots=True)
 class JvmSettings:
-    """Extra system properties, environment variables and TestNG listeners for a test JVM."""
+    """Extra system properties, environment variables and TestNG listeners for a test JVM.
+
+    `env` may hold credentials, so the console logs hide its values. `public_env` holds plain settings, like the
+    address Fineract's tests read, which stay readable in the logs.
+    """
 
     SHORTEST_HIDDEN_VALUE: ClassVar[int] = 8
     _BEARER_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[\w.~+/=-]{8,}")
@@ -441,6 +454,7 @@ class JvmSettings:
     properties: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
     listeners: tuple[str, ...] = ()
+    public_env: dict[str, str] = field(default_factory=dict)
 
     def merged(self, other: "JvmSettings") -> "JvmSettings":
         """Join two settings. The other one wins where both set the same name.
@@ -449,7 +463,12 @@ class JvmSettings:
             The joined settings.
         """
         listeners = self.listeners + tuple(name for name in other.listeners if name not in self.listeners)
-        return JvmSettings({**self.properties, **other.properties}, {**self.env, **other.env}, listeners)
+        return JvmSettings(
+            {**self.properties, **other.properties},
+            {**self.env, **other.env},
+            listeners,
+            {**self.public_env, **other.public_env},
+        )
 
     def java_arguments(self) -> list[str]:
         """Turn the properties into `-D` flags, which go before the main class.
@@ -473,7 +492,8 @@ class JvmSettings:
         Returns:
             This process's environment plus the extra variables, or None to inherit it unchanged.
         """
-        return {**os.environ, **self.env} if self.env else None
+        extra = {**self.public_env, **self.env}
+        return {**os.environ, **extra} if extra else None
 
     def hide_secrets(self, text: str) -> str:
         """Replace every bearer token and every env value of `SHORTEST_HIDDEN_VALUE` characters or more.
@@ -629,7 +649,9 @@ class JUnitLauncher:
 
     MAIN = "lesstests.LesstestsJUnit"
     SOURCE = Path(__file__).parent / "support" / "LesstestsJUnit.java"
-    _STATUS = {"PASS": Outcome.PASSED, "FAIL": Outcome.FAILED, "SKIP": Outcome.SKIPPED}
+
+    # `LesstestsJUnit` writes TestNG's status words on purpose.
+    _STATUS = TestNgLauncher._STATUS
 
     def one(self, test: JavaTest, reports: Path, settings: JvmSettings) -> list[str]:
         """Run one test the same way as many.
@@ -693,23 +715,16 @@ class JUnitSuite:
         """Ask `LesstestsJUnit discover` for every test method.
 
         Returns:
-            The tests, sorted by class and method.
+            The tests in the order JUnit runs them, which keeps the tests of a class together.
 
         Raises:
             RuntimeError: If the discovery JVM fails.
         """
         out = self.project.workdir / "lesstests-tests.tsv"
-        command = [
-            self.project.java,
-            *self.project.jvm_arguments,
-            *self._settings.java_arguments(),
-            "-cp",
-            self.project.classpath,
-            JUnitLauncher.MAIN,
-            "discover",
-            str(out),
-            *(str(root) for root in self.project.test_roots),
-        ]
+        roots = [str(root) for root in self.project.test_roots]
+        command = JvmRunner.java_command(
+            self.project, self._settings, [JUnitLauncher.MAIN, "discover", str(out), *roots]
+        )
         result = subprocess.run(
             command,
             cwd=self.project.run_folder,
@@ -719,10 +734,11 @@ class JUnitSuite:
             env=self._settings.environment(),
         )
         if result.returncode != 0:
-            raise RuntimeError(f"JUnit could not list the tests:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
+            output = self._settings.hide_secrets(f"{result.stdout[-4000:]}{result.stderr[-4000:]}")
+            raise RuntimeError(f"JUnit could not list the tests:\n{output}")
         found = [JavaTest(*line.split("\t")) for line in out.read_text(encoding="utf-8").splitlines() if line]
         prefix = f"{self.package}." if self.package else ""
-        return sorted(test for test in found if test.class_name.startswith(prefix))
+        return [test for test in found if test.class_name.startswith(prefix)]
 
 
 class JvmRunner:
@@ -757,7 +773,7 @@ class JvmRunner:
             return RunResult(Outcome.ERROR, time.monotonic() - started)
         return RunResult(self._launcher.outcomes(reports, [test])[test], time.monotonic() - started)
 
-    def run_suite(self, tests: list[JavaTest], name: str, timeout: float | None = None) -> SuiteRun:
+    def run_suite(self, tests: list[JavaTest], name: str) -> SuiteRun:
         """Run all these tests together in one JVM.
 
         Returns:
@@ -766,7 +782,7 @@ class JvmRunner:
         reports = self._fresh(self._output / name)
         arguments = self._launcher.many(tests, name, reports, self._settings)
         started = time.monotonic()
-        finished = self._java(arguments, reports, self._suite_timeout if timeout is None else timeout)
+        finished = self._java(arguments, reports, self._suite_timeout)
         seconds = time.monotonic() - started
         if not finished:
             return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), seconds, finished=False)
@@ -778,8 +794,16 @@ class JvmRunner:
         Returns:
             The command.
         """
-        project = self._project
-        flags = [*project.jvm_arguments, *self._settings.java_arguments()]
+        return self.java_command(self._project, self._settings, arguments)
+
+    @staticmethod
+    def java_command(project: BuiltProject, settings: JvmSettings, arguments: list[str]) -> list[str]:
+        """Build a java command: the project's flags, then the extra properties, then the classpath.
+
+        Returns:
+            The command.
+        """
+        flags = [*project.jvm_arguments, *settings.java_arguments()]
         return [project.java, *flags, "-cp", project.classpath, *arguments]
 
     def _java(self, arguments: list[str], reports: Path, timeout: float) -> bool:

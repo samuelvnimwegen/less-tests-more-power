@@ -266,7 +266,7 @@ def test_bench_runs_the_merge_projects_copy_with_the_recordings_base_path(
         return FakeRestCov()
 
     monkeypatch.setattr(cli, "RestCov", build)
-    monkeypatch.setattr(cli, "JvmRunner", FakeRunner)
+    monkeypatch.setattr(subjects, "JvmRunner", FakeRunner)
     monkeypatch.setattr(cli, "Benchmark", FakeBenchmark)
     monkeypatch.setattr(cli, "BenchReport", FakeBenchReport)
     FakeBenchmark.made.clear()
@@ -349,7 +349,10 @@ def test_record_on_fineract_uses_gradle_junit_and_a_per_class_reset_and_only_rec
     recorder = FakeRecorder.made[0]
     assert recorder.suite.project.module == ":integration-tests"
     assert [helper.name for helper in recorder.suite.project.helpers] == ["LesstestsJUnit.java"]
-    assert recorder.suite.settings.env["BACKEND_PORT"] == "8091"
+    assert recorder.suite.settings.public_env["BACKEND_PORT"] == "8091"
+
+    # The address is no secret, so the console logs keep it.
+    assert recorder.suite.settings.hide_secrets("127.0.0.1:8091") == "127.0.0.1:8091"
     assert recorder.service.address.port == 8092
     assert recorder.reset.facts() == {"reset": "every class"}
     assert recorder.tests is not None
@@ -361,12 +364,26 @@ def test_record_on_fineract_uses_gradle_junit_and_a_per_class_reset_and_only_rec
     assert recorder.meta["spec"] == str(out.resolve() / "project" / subjects.FINERACT.spec_file)
 
 
-def test_merge_refuses_a_suite_it_cannot_rewrite(tmp_path: Path) -> None:
+def test_merge_refuses_a_suite_it_cannot_rewrite(
+    tmp_path: Path, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
     recording = _recording(tmp_path / "rec")
     recording.write_meta({"subject": "fineract", "spec": str(tmp_path / "spec.json")})
     args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(tmp_path / "m")]
-    with pytest.raises(SystemExit, match="lesstests plan"):
+    with pytest.raises(ValueError, match="not fineract. Use `lesstests plan`"):
         cli.main(args)
+    assert not (tmp_path / "m").exists()
+
+
+def test_plan_refuses_an_out_folder_inside_the_recording(
+    tmp_path: Path, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    recording = _merge_ready_recording(tmp_path)
+    before = (recording.folder / "meta.json").read_text()
+    args = ["plan", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(recording.folder)]
+    with pytest.raises(ValueError, match="sits inside the recording"):
+        cli.main(args)
+    assert (recording.folder / "meta.json").read_text() == before
 
 
 def test_plan_writes_original_and_select_and_points_bench_at_the_recordings_copy(
@@ -382,7 +399,7 @@ def test_plan_writes_original_and_select_and_points_bench_at_the_recordings_copy
     meta = json.loads((out / "meta.json").read_text())
     assert meta["copy"] == str(recording.folder.resolve() / "project")
 
-    monkeypatch.setattr(cli, "JvmRunner", FakeRunner)
+    monkeypatch.setattr(subjects, "JvmRunner", FakeRunner)
     monkeypatch.setattr(cli, "Benchmark", FakeBenchmark)
     monkeypatch.setattr(cli, "BenchReport", FakeBenchReport)
     FakeBenchmark.made.clear()

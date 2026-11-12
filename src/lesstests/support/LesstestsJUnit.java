@@ -12,7 +12,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeSet;
 import org.junit.jupiter.api.Disabled;
 import org.junit.platform.commons.annotation.Testable;
 import org.junit.platform.commons.support.AnnotationSupport;
@@ -36,11 +35,12 @@ import org.junit.platform.launcher.core.LauncherFactory;
 /**
  * Lists and runs JUnit 5 test methods for lesstests, which knows a test as a class name and a method name.
  *
- * lesstests puts this file into its own copy of the project, so the JUnit Platform of the project itself does the
- * work. "discover OUT ROOT..." writes every test method under the class folders, without the disabled ones.
- * "run REPORTS IDS" runs the methods listed in IDS and writes REPORTS/results.tsv with one outcome per method.
- * A parameterized method or a test factory gets its worst child. A method whose class failed before it ran counts
- * as failed.
+ * lesstests compiles this file against the test classpath of its copy of the project, so the JUnit Platform of
+ * the project itself does the work. "discover OUT ROOT..." writes every test method under the class folders, without
+ * the disabled ones, in the order JUnit runs them, so @Order and the class order of the project hold. "run REPORTS
+ * IDS" runs the methods listed in IDS and writes REPORTS/results.tsv with one outcome per method. A parameterized
+ * method or a test factory gets its worst child. A method whose class, or an enclosing class, failed before it ran
+ * counts as failed.
  */
 public final class LesstestsJUnit {
 
@@ -70,7 +70,7 @@ public final class LesstestsJUnit {
                 .filters(ClassNameFilter.includeClassNamePatterns(".*"))
                 .build();
         TestPlan plan = LauncherFactory.create().discover(request);
-        Set<String> lines = new TreeSet<>();
+        Set<String> lines = new LinkedHashSet<>();
         for (TestIdentifier root : plan.getRoots()) {
             for (TestIdentifier identifier : plan.getDescendants(root)) {
                 TestSource source = identifier.getSource().orElse(null);
@@ -107,14 +107,20 @@ public final class LesstestsJUnit {
                 continue;
             }
             String[] parts = id.split("\t", 2);
-            Class<?> type = Class.forName(parts[0], false, loader);
+            outcomes.put(id, null);
+            Class<?> type;
+            try {
+                type = Class.forName(parts[0], false, loader);
+            } catch (ClassNotFoundException gone) {
+                // One class that is gone only loses its own tests. They stay MISSING.
+                continue;
+            }
             List<Method> methods = ReflectionSupport.findMethods(type,
                     method -> method.getName().equals(parts[1]) && AnnotationSupport.isAnnotated(method, Testable.class),
                     HierarchyTraversalMode.TOP_DOWN);
             for (Method method : methods) {
                 selectors.add(DiscoverySelectors.selectMethod(type, method));
             }
-            outcomes.put(id, null);
         }
         Outcomes listener = new Outcomes(outcomes);
         Launcher launcher = LauncherFactory.create();
@@ -192,8 +198,19 @@ public final class LesstestsJUnit {
             if (found != null) {
                 return found;
             }
-            String type = classes.get(id.split("\t", 2)[0]);
-            return type != null ? type : "MISSING";
+            // A nested class fails with its outer class, so look at every enclosing class too.
+            String type = id.split("\t", 2)[0];
+            while (true) {
+                String failed = classes.get(type);
+                if (failed != null) {
+                    return failed;
+                }
+                int inner = type.lastIndexOf('$');
+                if (inner < 0) {
+                    return "MISSING";
+                }
+                type = type.substring(0, inner);
+            }
         }
     }
 

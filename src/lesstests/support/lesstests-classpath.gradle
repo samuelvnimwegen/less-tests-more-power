@@ -2,7 +2,8 @@
 // Gradle project. The task builds the tests and every jar they need. Then it writes four files next to the build:
 // the test runtime classpath, the compiled test class folders, the java binary of the module's toolchain and the
 // JVM flags of the module's test task, so a test JVM of lesstests starts like one of Gradle. Java agents stay out,
-// since they belong to Gradle's own reports.
+// since they belong to Gradle's own reports. A fifth file names the root the paths start from, so lesstests can
+// still read them after the copy moved.
 allprojects {
     if (path == gradle.startParameter.projectProperties['lesstests.module']) {
         afterEvaluate {
@@ -14,6 +15,7 @@ allprojects {
             tasks.register('lesstestsClasspath') {
                 dependsOn 'testClasses', classpath
                 doLast {
+                    out.file('lesstests-root.txt').asFile.text = out.asFile.absolutePath
                     out.file('lesstests-classpath.txt').asFile.text = classpath.asPath
                     out.file('lesstests-test-roots.txt').asFile.text = roots.asPath
                     out.file('lesstests-java.txt').asFile.text = launcher.get().executablePath.asFile.absolutePath
