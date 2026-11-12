@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from lesstests.java import JavaSuite, JavaTest, JvmRunner, JvmSettings, MavenProject, Outcome, Overlay
+from lesstests.java import (
+    JavaSuite,
+    JavaTest,
+    JvmRunner,
+    JvmSettings,
+    MavenProject,
+    Outcome,
+    Overlay,
+    TestNgLauncher,
+)
 
 SOURCE = """package generations.single_agent;
 
@@ -67,10 +76,10 @@ def test_test_id_round_trip() -> None:
 def test_outcome_comes_from_the_matching_method(tmp_path: Path) -> None:
     report = tmp_path / "testng-results.xml"
     report.write_text(RESULTS)
-    assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "addPet")) is Outcome.FAILED
-    assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "other")) is Outcome.PASSED
-    assert JvmRunner._read_outcome(report, JavaTest("generations.single_agent.Pet", "setUp")) is Outcome.ERROR
-    assert JvmRunner._read_outcome(tmp_path / "missing.xml", JavaTest("a.B", "c")) is Outcome.ERROR
+    assert TestNgLauncher._read_outcome(report, JavaTest("generations.single_agent.Pet", "addPet")) is Outcome.FAILED
+    assert TestNgLauncher._read_outcome(report, JavaTest("generations.single_agent.Pet", "other")) is Outcome.PASSED
+    assert TestNgLauncher._read_outcome(report, JavaTest("generations.single_agent.Pet", "setUp")) is Outcome.ERROR
+    assert TestNgLauncher._read_outcome(tmp_path / "missing.xml", JavaTest("a.B", "c")) is Outcome.ERROR
 
 
 def _report_with(tmp_path: Path, *statuses: str) -> Path:
@@ -92,7 +101,7 @@ def _report_with(tmp_path: Path, *statuses: str) -> Path:
 def test_a_test_that_ran_more_than_once_gets_its_worst_run(
     tmp_path: Path, statuses: tuple[str, ...], outcome: Outcome
 ) -> None:
-    assert JvmRunner._read_outcome(_report_with(tmp_path, *statuses), JavaTest("s.Pet", "addPet")) is outcome
+    assert TestNgLauncher._read_outcome(_report_with(tmp_path, *statuses), JavaTest("s.Pet", "addPet")) is outcome
 
 
 TRICKY = """package s;
@@ -178,7 +187,7 @@ def _project(tmp_path: Path) -> MavenProject:
 def test_command_puts_properties_before_the_main_class_and_listeners_after(tmp_path: Path) -> None:
     settings = JvmSettings({"k": "v"}, {}, ("lesstests.LesstestsProxyListener",))
     runner = JvmRunner(_project(tmp_path), tmp_path / "out", settings=settings)
-    command = runner.command(["-methods", "a.B.c"], tmp_path / "reports")
+    command = runner.command(TestNgLauncher().one(JavaTest("a.B", "c"), tmp_path / "reports", settings))
     assert command[:2] == ["java", "-Dk=v"]
     assert command.index("org.testng.TestNG") < command.index("-listener")
     assert command[-4:] == ["-listener", "lesstests.LesstestsProxyListener", "-methods", "a.B.c"]
@@ -256,11 +265,12 @@ def test_run_suite_counts_every_test_as_an_error_when_the_jvm_hangs(
     tests = [JavaTest("a.B", "c")]
     run = JvmRunner(_project(tmp_path), tmp_path / "out").run_suite(tests, "r", timeout=1)
     assert run.outcomes == {tests[0]: Outcome.ERROR}
+    assert not run.finished
 
 
 def test_suite_xml_lists_each_method_under_its_class() -> None:
     tests = [JavaTest("g.B", "two"), JavaTest("g.A", "one"), JavaTest("g.B", "one")]
-    root = ET.fromstring(JvmRunner.suite_xml(tests, "r").split("\n", 2)[2])
+    root = ET.fromstring(TestNgLauncher.suite_xml(tests, "r").split("\n", 2)[2])
     found = {node.get("name"): [include.get("name") for include in node.iter("include")] for node in root.iter("class")}
     assert found == {"g.A": ["one"], "g.B": ["one", "two"]}
 

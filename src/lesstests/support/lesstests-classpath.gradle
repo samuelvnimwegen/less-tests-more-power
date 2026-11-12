@@ -1,0 +1,26 @@
+// Adds a lesstestsClasspath task to the module named by -Plesstests.module. lesstests runs it on its own copy of a
+// Gradle project. The task builds the tests and every jar they need. Then it writes four files next to the build:
+// the test runtime classpath, the compiled test class folders, the java binary of the module's toolchain and the
+// JVM flags of the module's test task, so a test JVM of lesstests starts like one of Gradle. Java agents stay out,
+// since they belong to Gradle's own reports.
+allprojects {
+    if (path == gradle.startParameter.projectProperties['lesstests.module']) {
+        afterEvaluate {
+            def classpath = sourceSets.test.runtimeClasspath
+            def roots = sourceSets.test.output.classesDirs
+            def launcher = javaToolchains.launcherFor(java.toolchain)
+            def testTask = tasks.named('test', Test)
+            def out = rootProject.layout.projectDirectory
+            tasks.register('lesstestsClasspath') {
+                dependsOn 'testClasses', classpath
+                doLast {
+                    out.file('lesstests-classpath.txt').asFile.text = classpath.asPath
+                    out.file('lesstests-test-roots.txt').asFile.text = roots.asPath
+                    out.file('lesstests-java.txt').asFile.text = launcher.get().executablePath.asFile.absolutePath
+                    def flags = testTask.get().allJvmArgs.findAll { !it.startsWith('-javaagent') }
+                    out.file('lesstests-jvm-args.txt').asFile.text = flags.join('\n')
+                }
+            }
+        }
+    }
+}
