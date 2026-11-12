@@ -130,8 +130,8 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
         Returns:
             The connection, not yet connected.
         """
-        upstream = cast("_ProxyServer", self.server).upstream
-        return http.client.HTTPConnection(upstream.host, upstream.port, timeout=60)
+        server = cast("_ProxyServer", self.server)
+        return http.client.HTTPConnection(server.upstream.host, server.upstream.port, timeout=server.timeout)
 
     def _send_upstream(self, request: HttpRequest) -> HttpResponse:
         connection = self._connect()
@@ -179,9 +179,10 @@ class _ForwardingHandler(BaseHTTPRequestHandler):
 
 
 class _ProxyServer(_LoggingServer):
-    def __init__(self, listen: Address, upstream: Address, log: "ExchangeLog") -> None:
+    def __init__(self, listen: Address, upstream: Address, log: "ExchangeLog", timeout: float) -> None:
         super().__init__(listen, _ForwardingHandler, log)
         self.upstream = upstream
+        self.timeout = timeout
 
 
 class _InterceptingServer(_LoggingServer):
@@ -424,13 +425,14 @@ class RecordingProxy(Proxy):
     Example: the tests call `localhost:8081`, so the proxy listens there and forwards to the service on 8082.
     """
 
-    def __init__(self, listen: Address, upstream: Address) -> None:
-        """Set up the proxy without opening the port yet."""
+    def __init__(self, listen: Address, upstream: Address, timeout: float = 60.0) -> None:
+        """Set up the proxy without opening the port yet. `timeout` is how long one answer may take."""
         super().__init__(listen)
         self._upstream = upstream
+        self._timeout = timeout
 
     def _make_server(self) -> _LoggingServer:
-        return _ProxyServer(self._listen, self._upstream, self.log)
+        return _ProxyServer(self._listen, self._upstream, self.log, self._timeout)
 
 
 class InterceptingProxy(Proxy):

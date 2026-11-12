@@ -4,10 +4,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, ClassVar, Protocol, Self
 
 from lesstests.exchange import Exchange
-from lesstests.java import JavaSuite, JavaTest, JvmRunner, Outcome
+from lesstests.java import JavaTest, JvmRunner, Outcome, SuiteFinder
 from lesstests.proxy import Proxy
 from lesstests.service import Service
 
@@ -193,18 +193,120 @@ class Recording:
         return self.tests_folder / f"{test.id}.json"
 
 
+class ResetPolicy(Protocol):
+    """Says before which tests the recorder resets the service."""
+
+    def due(self, previous: JavaTest | None, test: JavaTest) -> bool:
+        """Decide whether the service gets reset before `test`. `previous` is the test this run recorded last.
+
+        Returns:
+            True for a reset.
+        """
+        ...
+
+    def facts(self) -> dict[str, str]:
+        """Name the policy for the recording's facts, so a resumed run can't mix two policies.
+
+        Returns:
+            The facts, empty for the default, so older recordings still resume.
+        """
+        ...
+
+    def redo(self, recorded: set[JavaTest], tests: list[JavaTest]) -> set[JavaTest]:
+        """Pick the recorded tests a resumed run has to record again, so they see the same data as before.
+
+        Returns:
+            The tests to record again.
+        """
+        ...
+
+
+class EveryTest:
+    """Reset before every test, so each one starts from the same data."""
+
+    def due(self, previous: JavaTest | None, test: JavaTest) -> bool:
+        """Always reset.
+
+        Returns:
+            True.
+        """
+        return True
+
+    def facts(self) -> dict[str, str]:
+        """The default, so nothing to store.
+
+        Returns:
+            No facts.
+        """
+        return {}
+
+    def redo(self, recorded: set[JavaTest], tests: list[JavaTest]) -> set[JavaTest]:
+        """Nothing, since every test starts from a reset anyway.
+
+        Returns:
+            No tests.
+        """
+        return set()
+
+
+class EveryClass:
+    """Reset before the first test of each class, for a service whose reset takes too long to do per test.
+
+    The tests of one class still run alone, each in its own JVM, but they see what the earlier ones left behind.
+    """
+
+    NAME: ClassVar[str] = "every class"
+
+    def due(self, previous: JavaTest | None, test: JavaTest) -> bool:
+        """Reset when the class changes, and before the first test of a run.
+
+        Returns:
+            True for a reset.
+        """
+        return previous is None or previous.class_name != test.class_name
+
+    def facts(self) -> dict[str, str]:
+        """Store the policy.
+
+        Returns:
+            The facts.
+        """
+        return {"reset": self.NAME}
+
+    def redo(self, recorded: set[JavaTest], tests: list[JavaTest]) -> set[JavaTest]:
+        """Every recorded test of a class that a stopped run left half done.
+
+        Its remaining tests would start from a reset, without what the earlier ones left behind.
+
+        Returns:
+            The tests to record again.
+        """
+        unfinished = {test.class_name for test in tests if test not in recorded}
+        return {test for test in recorded if test.class_name in unfinished}
+
+
 class Recorder:
-    """The Record step. Runs every test alone after a reset, with the proxy writing down each exchange."""
+    """The Record step. Runs every test alone, with the proxy writing down each exchange.
+
+    The reset policy says before which tests the service gets reset.
+    """
 
     def __init__(
-        self, suite: JavaSuite, runner: JvmRunner, service: Service, proxy: Proxy, recording: Recording
+        self,
+        suite: SuiteFinder,
+        runner: JvmRunner,
+        service: Service,
+        proxy: Proxy,
+        recording: Recording,
+        reset: ResetPolicy | None = None,
     ) -> None:
-        """Wire the parts together."""
+        """Wire the parts together. The default policy resets before every test."""
         self._suite = suite
         self._runner = runner
         self._service = service
         self._proxy = proxy
         self._recording = recording
+        self._reset = reset or EveryTest()
 
     def run(
         self,
@@ -217,6 +319,7 @@ class Recorder:
         `tests` limits the run to some tests, such as the merged copies of one merge round.
         """
         tests = self._suite.tests() if tests is None else sorted(tests)
+        meta = {**meta, **self._reset.facts()}
         self._recording.check_resume(meta, tests)
         started = datetime.now(UTC).isoformat(timespec="seconds")
         if self._recording.has_meta:
@@ -225,10 +328,14 @@ class Recorder:
         with self._proxy:
             try:
                 self._service.start()
+                recorded = {test for test in tests if self._recording.has(test)}
+                pending = (set(tests) - recorded) | self._reset.redo(recorded, tests)
+                previous: JavaTest | None = None
                 for number, test in enumerate(tests, start=1):
-                    if self._recording.has(test):
+                    if test not in pending:
                         continue
-                    record = self._record_one(test)
+                    record = self._record_one(test, self._reset.due(previous, test))
+                    previous = test
                     self._recording.save(record)
                     if progress is not None:
                         progress(number, len(tests), record)
@@ -237,8 +344,9 @@ class Recorder:
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         self._recording.write_meta({**meta, "tests": len(tests), "started": started, "finished": finished})
 
-    def _record_one(self, test: JavaTest) -> RecordedTest:
-        self._service.reset()
+    def _record_one(self, test: JavaTest, reset: bool) -> RecordedTest:
+        if reset:
+            self._service.reset()
 
         # A late answer from the previous test must not end up in this one.
         self._proxy.log.take()
