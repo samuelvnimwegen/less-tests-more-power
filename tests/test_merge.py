@@ -1,0 +1,355 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from lesstests.api import ApiDescription
+from lesstests.coverage import CoverageItem, CoverageSet, Criterion, SuiteCoverage
+from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
+from lesstests.java import CompileError, JavaTest, MaskedJava, Outcome
+from lesstests.merge import JavaTestFile, MapPair, MergedTest, MergePlanner, Merger
+from lesstests.recording import RecordedTest
+
+SPEC = {
+    "openapi": "3.0.0",
+    "servers": [{"url": "https://storage.googleapis.com/"}],
+    "paths": {
+        "/files": {
+            "get": {"parameters": [{"in": "query", "name": name} for name in ("corpora", "orderBy", "q", "pageToken")]},
+            "post": {},
+        },
+    },
+}
+
+SOURCE = """package generations;
+
+import java.util.Map;
+
+public class Files extends RestAssuredClient {
+
+    @Test
+    public void listByUser() {
+        Response resp = get("https://www.googleapis.com/drive/v3/files",
+                Map.of("corpora", "user"),
+                Map.of("Accept", "application/json"), true);
+        Assert.assertEquals(resp.statusCode(), 200, "a, b (c");
+    }
+
+    @Test
+    public void sortByTime() {
+        Response resp = get("/files", Map.of("corpora", "user", "orderBy", "modifiedTime"), null, true);
+        Assert.assertEquals(resp.statusCode(), 200);
+    }
+
+    @Test
+    public void starred() {
+        // A comment with get( in it.
+        Map<String, Object> params = Map.of("q", "starred = true");
+        Response resp = get("/files", params, null, true);
+        Assert.assertEquals(resp.statusCode(), 200);
+    }
+
+    @Test
+    public void withVariable() {
+        String token = "x";
+        Response resp = get("/files", Map.of("pageToken", token), null, true);
+        Assert.assertEquals(resp.statusCode(), 200);
+    }
+
+    @Test
+    public void twoCalls() {
+        get("/files", null, null, true);
+        get("/files", null, null, true);
+    }
+
+    @Test
+    public void createFile() {
+        Response resp = post("/files", null, Map.of("Content-Type", "text/plain"), "x", true);
+        Assert.assertEquals(resp.statusCode(), 400);
+    }
+}
+"""
+
+TARGETS = {
+    "listByUser": ("GET", "/drive/v3/files?corpora=user", 200),
+    "sortByTime": ("GET", "/files?corpora=user&orderBy=modifiedTime", 200),
+    "starred": ("GET", "/files?q=starred+%3D+true", 200),
+    "withVariable": ("GET", "/files?pageToken=x", 200),
+    "createFile": ("POST", "/files", 400),
+}
+
+
+def _api(tmp_path: Path, spec: dict[str, object] = SPEC) -> ApiDescription:
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(spec))
+    return ApiDescription.load(path, "/drive/v3")
+
+
+def _record(test: JavaTest, method: str, target: str, status: int) -> RecordedTest:
+    request = HttpRequest(method, target, Headers((("Host", "www.googleapis.com"),)), Body())
+    response = HttpResponse(status, "", Headers((("Content-Type", "application/json; charset=UTF-8"),)), Body())
+    return RecordedTest(test, Outcome.PASSED, 1.0, [Exchange(request, response)])
+
+
+def _planner(tmp_path: Path, source: str = SOURCE, targets: dict[str, tuple[str, str, int]] = TARGETS) -> MergePlanner:
+    root = tmp_path / "java"
+    (root / "generations").mkdir(parents=True)
+    (root / "generations" / "Files.java").write_text(source)
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in targets.items()]
+    return MergePlanner(records, _api(tmp_path), root)
+
+
+def test_masking_keeps_every_offset() -> None:
+    text = "call(\"a, (b\", 'c', /* d, ( */ x) // e, ("
+    masked = MaskedJava(text)
+    assert len(masked.masked) == len(text)
+    assert masked.split_arguments(4) == [(5, 12), (14, 17), (30, 31)]
+
+
+def test_a_method_is_editable_only_with_one_call_and_literal_maps(tmp_path: Path) -> None:
+    root = tmp_path / "java"
+    root.mkdir()
+    (root / "Files.java").write_text(SOURCE)
+    file = JavaTestFile(root / "Files.java")
+    assert file.method("listByUser").params.names() == {"corpora"}  # type: ignore[union-attr]
+    assert file.method("starred").params.names() == {"q"}  # type: ignore[union-attr]
+    assert file.method("sortByTime").headers.pairs == ()  # type: ignore[union-attr]
+    assert file.method("twoCalls") is None
+    assert file.method("missing") is None
+
+
+def test_the_first_round_merges_into_the_test_with_the_most_names(tmp_path: Path) -> None:
+    planner = _planner(tmp_path)
+    merged = planner.first_round()
+    assert len(merged) == 1
+    merge = merged[0]
+    assert merge.base.method == "sortByTime"
+    assert merge.test == JavaTest("generations.Files", "lesstestsMerged1")
+    assert merge.key.status == 200
+    assert merge.key.response_type == "application/json"
+
+    # `withVariable` sends its value through a local variable, which would not compile in another method.
+    assert [pair.name for pair in merge.query] == ["q"]
+    assert {donor.method for donor in merge.donors} == {"listByUser", "starred", "withVariable"}
+
+
+def test_the_merged_copy_lands_at_the_end_of_the_base_class(tmp_path: Path) -> None:
+    planner = _planner(tmp_path)
+    edited = planner.edited_files(planner.first_round())
+    text = edited[Path("generations", "Files.java")]
+    assert text.count("public void sortByTime()") == 1
+    assert "public void lesstestsMerged1()" in text
+    expected = (
+        'get("/files", java.util.Map.ofEntries(java.util.Map.entry("corpora", "user"), '
+        'java.util.Map.entry("orderBy", "modifiedTime"), java.util.Map.entry("q", "starred = true")), null, true)'
+    )
+    assert expected in text
+    assert text.rstrip().endswith("}")
+    assert text.index("lesstestsMerged1") > text.index("createFile")
+
+
+def test_a_name_the_base_map_holds_is_never_added_twice(tmp_path: Path) -> None:
+    source = """package generations;
+
+public class Files {
+    @Test
+    public void base() {
+        get("/files", Map.of("corpora", "user", "orderBy", "name", "q", "x"), null, true);
+    }
+
+    @Test
+    public void donor() {
+        get("/files", Map.of("corpora", "drive"), null, true);
+    }
+}
+"""
+    targets = {"base": ("GET", "/files?orderBy=name&q=x", 200), "donor": ("GET", "/files?corpora=drive", 200)}
+
+    # The base never sent corpora, but its map holds it, so `Map.ofEntries` would throw on a second one.
+    assert _planner(tmp_path, source, targets).first_round() == []
+
+
+class FakeRunner:
+    """Answers 400 for every merge whose donors include a test named in `breaks`."""
+
+    def __init__(self, breaks: set[str]) -> None:
+        self.breaks = breaks
+        self.rounds: list[list[str]] = []
+
+    def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
+        self.rounds.append([merge.test.method for merge in merged])
+        found = {}
+        for merge in merged:
+            status = 400 if any(donor.method in self.breaks for donor in merge.donors) else 200
+            found[merge.test] = _record(merge.test, "GET", "/files?corpora=user", status)
+        return found
+
+
+WIDE_SPEC = {
+    "openapi": "3.0.0",
+    "paths": {
+        "/files": {
+            "get": {
+                "parameters": [{"in": "query", "name": name} for name in ("corpora", "orderBy", "p1", "p2", "p3", "p4")]
+            }
+        }
+    },
+}
+
+
+def _wide_source(donors: list[str]) -> tuple[str, dict[str, tuple[str, str, int]]]:
+    methods = []
+    targets = {}
+    for number, name in enumerate(["base", *donors]):
+        pairs = '"corpora", "user", "orderBy", "name"' if name == "base" else f'"p{number}", "v"'
+        methods.append(
+            f'    @Test\n    public void {name}() {{\n        get("/files", Map.of({pairs}), null, true);\n    }}\n'
+        )
+        query = "corpora=user&orderBy=name" if name == "base" else f"p{number}=v"
+        targets[name] = ("GET", f"/files?{query}", 200)
+    return "package generations;\n\npublic class Files {\n" + "\n".join(methods) + "}\n", targets
+
+
+def test_a_merge_that_changes_the_status_gets_split_until_the_bad_donor_is_alone(tmp_path: Path) -> None:
+    donors = ["d1", "d2", "d3", "bad"]
+    source, targets = _wide_source(donors)
+    root = tmp_path / "java"
+    (root / "generations").mkdir(parents=True)
+    (root / "generations" / "Files.java").write_text(source)
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in targets.items()]
+    api = _api(tmp_path, WIDE_SPEC)
+    runner = FakeRunner({"bad"})
+    outcome = Merger(MergePlanner(records, api, root), runner, api, rounds=4).run(tmp_path / "rounds")
+
+    assert [len(names) for names in runner.rounds] == [1, 2, 2]
+    kept = sorted(sorted(donor.method for donor in merge.donors) for merge in outcome.accepted)
+    assert kept == [["d1", "d2"], ["d3"]]
+    reasons = [attempt["reason"] for attempt in outcome.attempts if not attempt["kept"]]
+    assert reasons == ["got 400 instead of 200"] * 3
+    assert len({merge.test for merge in outcome.accepted}) == 2
+
+
+class ShapedRunner:
+    """Gives every merged copy the same exchanges, or no record at all when `targets` is None."""
+
+    def __init__(self, targets: list[tuple[str, str, int]] | None) -> None:
+        self.targets = targets
+
+    def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
+        if self.targets is None:
+            return {}
+        found = {}
+        for merge in merged:
+            exchanges = [exchange for target in self.targets for exchange in _record(merge.test, *target).exchanges]
+            found[merge.test] = RecordedTest(merge.test, Outcome.PASSED, 1.0, exchanges)
+        return found
+
+
+@pytest.mark.parametrize(
+    ("targets", "reason"),
+    [
+        (None, "not recorded"),
+        ([("GET", "/files?corpora=user", 200), ("GET", "/files", 200)], "sent 2 requests"),
+        ([("POST", "/files", 200)], "reached another operation"),
+    ],
+)
+def test_a_merged_copy_that_is_not_one_request_to_its_operation_is_dropped(
+    tmp_path: Path, targets: list[tuple[str, str, int]] | None, reason: str
+) -> None:
+    api = _api(tmp_path)
+    outcome = Merger(_planner(tmp_path), ShapedRunner(targets), api, rounds=1).run(tmp_path / "rounds")
+    assert outcome.accepted == []
+    assert outcome.attempts
+    assert {attempt["reason"] for attempt in outcome.attempts} == {reason}
+
+
+def test_one_request_tests_the_planner_cannot_merge_are_listed_with_a_reason(tmp_path: Path) -> None:
+    targets = {**TARGETS, "twoCalls": ("GET", "/files", 200), "listByUser": ("GET", "/nothing", 200)}
+    planner = _planner(tmp_path, targets=targets)
+    assert sorted((test.method, reason) for test, reason in planner.skipped) == [
+        ("listByUser", "its request matched no documented operation"),
+        ("twoCalls", "its method isn't one helper call with literal maps"),
+    ]
+
+
+def _coverage_with(operations: dict[str, str]) -> SuiteCoverage:
+    per_test = {
+        JavaTest("generations.Files", name): CoverageSet([CoverageItem(Criterion.OPERATION, operation)])
+        for name, operation in operations.items()
+    }
+    return SuiteCoverage(per_test, CoverageSet.union(per_test.values()), {})
+
+
+class CompileRunner(FakeRunner):
+    """Fails to compile every round that holds a merge with the donor `bad`."""
+
+    def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
+        if any(donor.method == "bad" for merge in merged for donor in merge.donors):
+            raise CompileError(f"Maven failed in {folder}")
+        return super().record(merged, edited, folder)
+
+
+def test_a_copy_that_does_not_compile_only_drops_itself(tmp_path: Path) -> None:
+    source, targets = _wide_source(["d1", "d2", "d3", "bad"])
+    root = tmp_path / "java"
+    (root / "generations").mkdir(parents=True)
+    (root / "generations" / "Files.java").write_text(source)
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in targets.items()]
+    api = _api(tmp_path, WIDE_SPEC)
+    outcome = Merger(MergePlanner(records, api, root), CompileRunner(set()), api, rounds=4).run(tmp_path / "rounds")
+
+    kept = sorted(sorted(donor.method for donor in merge.donors) for merge in outcome.accepted)
+    assert kept == [["d1", "d2"], ["d3"]]
+    assert [attempt["reason"] for attempt in outcome.attempts if not attempt["kept"]] == ["didn't compile"] * 3
+
+
+def test_a_copy_lands_in_the_class_named_like_the_file(tmp_path: Path) -> None:
+    source = SOURCE + "\nclass FilesHelper {\n    void help() {}\n}\n"
+    planner = _planner(tmp_path, source)
+    text = next(iter(planner.edited_files(planner.first_round()).values()))
+    assert text.index("lesstestsMerged1") < text.index("class FilesHelper")
+
+
+def test_matching_that_differs_from_restcov_stops_the_merge(tmp_path: Path) -> None:
+    records = [_record(JavaTest("generations.Files", name), *target) for name, target in TARGETS.items()]
+    operations = {name: f"{method} /files" for name, (method, _, _) in TARGETS.items()}
+    MergePlanner.check_matching(records, _api(tmp_path), _coverage_with(operations))
+
+    # RESTCov saw another operation for one test, so the groups built on the tool's matching can't be trusted.
+    with pytest.raises(ValueError, match="match 1 tests to other operations, such as generations.Files.starred"):
+        MergePlanner.check_matching(records, _api(tmp_path), _coverage_with({**operations, "starred": "GET /x"}))
+
+
+@pytest.mark.parametrize("value", ['"text"', "5", "-2.5", "true", "10L", "'c'"])
+def test_plain_literals_are_portable(value: str) -> None:
+    from lesstests.merge import MapPair
+
+    assert MapPair('"k"', value).portable
+    assert not MapPair('"k"', "token").portable
+    assert not MapPair("KEY", value).portable
+
+
+def test_a_name_the_base_sends_in_its_path_string_is_not_added_again(tmp_path: Path) -> None:
+    source = """package generations;
+
+public class Files {
+    @Test
+    public void base() {
+        get("/files?corpora=user", Map.of(), null, true);
+    }
+
+    @Test
+    public void donor() {
+        get("/files", Map.of("corpora", "drive"), null, true);
+    }
+}
+"""
+
+    # Found on PetStore, where a merged copy sent `status=available&status=available`.
+    targets = {"base": ("GET", "/files?corpora=user", 200), "donor": ("GET", "/files?corpora=drive", 200)}
+    assert _planner(tmp_path, source, targets).first_round() == []
+
+
+def test_a_key_with_a_java_escape_gives_its_real_name() -> None:
+    # Java writes `it's` as "it\'s", and JSON doesn't know that escape.
+    assert MapPair('"it\\\'s"', "1").name == "it's"

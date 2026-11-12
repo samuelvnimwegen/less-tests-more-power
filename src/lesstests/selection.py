@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import csr_array, lil_array
 
-from lesstests.coverage import CoverageItem, SuiteCoverage
+from lesstests.coverage import CoverageItem, CoverageSet, SuiteCoverage
 from lesstests.java import JavaTest
 
 
@@ -152,3 +152,51 @@ class CoverageSelector:
             reach[item, tests + item] = 1
         count = np.concatenate([np.ones(tests), np.zeros(items)]).reshape(1, -1)
         return [LinearConstraint(csr_array(reach), -np.inf, 0), LinearConstraint(count, size, size)]
+
+
+class SmallestCover:
+    """Picks the fewest tests that still reach every item of a target, then the fewest requests among those.
+
+    The first program finds the smallest size. The second keeps that size and asks for the fewest requests.
+    """
+
+    def select(
+        self, candidates: dict[JavaTest, CoverageSet], requests: dict[JavaTest, int], target: CoverageSet
+    ) -> list[JavaTest]:
+        """Pick the tests.
+
+        Returns:
+            The picked tests, sorted.
+
+        Raises:
+            ValueError: If no candidate reaches some item of the target.
+            RuntimeError: If the solver finds no plan.
+        """
+        tests = sorted(candidates)
+        items = sorted(target.items)
+        if not items:
+            return []
+        index = {item: number for number, item in enumerate(items)}
+        reach = lil_array((len(items), len(tests)))
+        for column, test in enumerate(tests):
+            for item in candidates[test].items:
+                if item in index:
+                    reach[index[item], column] = 1
+        covered = csr_array(reach)
+        unreachable = [items[row] for row in range(len(items)) if covered[[row], :].sum() == 0]
+        if unreachable:
+            raise ValueError(f"No candidate reaches {len(unreachable)} target items, such as {unreachable[0]}")
+        every_item = LinearConstraint(covered, 1, np.inf)
+        integrality = np.ones(len(tests))
+        bounds = Bounds(0, 1)
+
+        fewest_tests = milp(np.ones(len(tests)), constraints=[every_item], integrality=integrality, bounds=bounds)
+        if not fewest_tests.success:
+            raise RuntimeError(f"The cover program failed: {fewest_tests.message}")
+        size = round(fewest_tests.fun)
+        keep_size = LinearConstraint(np.ones((1, len(tests))), size, size)
+        cost = np.asarray([requests[test] for test in tests], dtype=float)
+        cheapest = milp(cost, constraints=[every_item, keep_size], integrality=integrality, bounds=bounds)
+        if not cheapest.success:
+            raise RuntimeError(f"The request program failed: {cheapest.message}")
+        return sorted(test for test, chosen in zip(tests, cheapest.x, strict=True) if chosen > 0.5)

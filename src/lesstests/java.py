@@ -1,12 +1,14 @@
+import os
 import re
 import shutil
 import subprocess
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import ClassVar, Self
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -32,15 +34,88 @@ class JavaTest:
         return cls(class_name, method)
 
 
-class JavaSuite:
-    """The TestNG tests in one package of a Maven project, such as `generations.single_agent`."""
+class MaskedJava:
+    """Java source with every literal and comment blanked out, at the same length, so offsets stay valid."""
 
     # Literals match before comments, so a "/*" inside a string can't open a comment.
     _LITERALS_AND_COMMENTS = re.compile(
         r'"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
     )
+
+    def __init__(self, text: str) -> None:
+        """Mask the text once."""
+        self.text = text
+        self.masked = self._LITERALS_AND_COMMENTS.sub(self._blank, text)
+
+    @staticmethod
+    def _blank(match: re.Match[str]) -> str:
+        """Keep the quotes of a literal and fill the rest with `x`, so a `(` or `,` inside it can't count.
+
+        Returns:
+            The blanked text, as long as the original.
+        """
+        text = match.group()
+        if text.startswith(('"', "'")):
+            quote = 3 if text.startswith('"""') else 1
+            return text[:quote] + "x" * (len(text) - 2 * quote) + text[-quote:]
+        return re.sub(r"[^\n]", " ", text)
+
+    def closing(self, opening: int) -> int:
+        """Find the bracket that closes the one at `opening`.
+
+        Returns:
+            The offset of the closing bracket.
+
+        Raises:
+            ValueError: If it never closes.
+        """
+        pairs = {"(": ")", "{": "}", "[": "]"}
+        stack = []
+        for offset in range(opening, len(self.masked)):
+            char = self.masked[offset]
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in pairs.values():
+                if not stack or stack.pop() != char:
+                    raise ValueError(f"Unbalanced {char!r} at {offset}")
+                if not stack:
+                    return offset
+        raise ValueError(f"The bracket at {opening} never closes")
+
+    def split_arguments(self, opening: int) -> list[tuple[int, int]]:
+        """Split the arguments of the call whose `(` sits at `opening`.
+
+        Returns:
+            The start and end offset of every argument, with the spaces around it trimmed.
+        """
+        end = self.closing(opening)
+        spans, start, depth = [], opening + 1, 0
+        for offset in range(opening + 1, end):
+            char = self.masked[offset]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                spans.append(self._trim(start, offset))
+                start = offset + 1
+        if self.masked[start:end].strip():
+            spans.append(self._trim(start, end))
+        return spans
+
+    def _trim(self, start: int, end: int) -> tuple[int, int]:
+        while start < end and self.masked[start].isspace():
+            start += 1
+        while end > start and self.masked[end - 1].isspace():
+            end -= 1
+        return start, end
+
+
+class JavaSuite:
+    """The TestNG tests in one package of a Maven project, such as `generations.single_agent`."""
+
     _PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
-    _TEST_METHOD = re.compile(
+    TEST_METHOD = re.compile(
         r"@Test\b(?P<args>\s*\([^)]*\))?\s*(?:@\w+(?:\s*\([^)]*\))?\s*)*"
         r"public\s+(?:final\s+)?void\s+(?P<name>\w+)\s*\("
     )
@@ -74,44 +149,75 @@ class JavaSuite:
         return sorted(found)
 
     def _tests_in(self, path: Path) -> list[JavaTest]:
-        source = self._LITERALS_AND_COMMENTS.sub(self._blank, path.read_text(encoding="utf-8"))
+        source = MaskedJava(path.read_text(encoding="utf-8")).masked
         if self._CLASS_TEST.search(source):
             raise ValueError(f"{path} puts @Test on the class, which lesstests does not support")
         package = self._PACKAGE.search(source)
         class_name = f"{package.group(1)}.{path.stem}" if package else path.stem
         return [
             JavaTest(class_name, match.group("name"))
-            for match in self._TEST_METHOD.finditer(source)
+            for match in self.TEST_METHOD.finditer(source)
             if not self._DISABLED.search(match.group("args") or "")
         ]
 
-    @staticmethod
-    def _blank(match: re.Match[str]) -> str:
-        """Empty a literal and turn a comment into a space, so a `)` or `/*` in a string can't confuse the patterns.
 
-        Returns:
-            The blanked text.
+@dataclass(frozen=True, slots=True)
+class Overlay:
+    """A file or folder put into the project copy before it compiles. A folder replaces the target folder."""
+
+    source: Path
+    target: str
+
+    def apply(self, workdir: Path) -> None:
+        """Copy the source into the project copy.
+
+        Raises:
+            FileNotFoundError: If the source does not exist.
         """
-        text = match.group()
-        if text.startswith(('"', "'")):
-            return text[0] * 2
-        return " "
+        target = workdir / self.target
+        if self.source.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(self.source, target)
+        elif self.source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.source, target)
+        else:
+            raise FileNotFoundError(f"Nothing to put into the project at {self.source}")
+
+
+class CompileError(RuntimeError):
+    """Maven could not build the copy of a project."""
 
 
 class MavenProject:
     """A private copy of a Maven project, compiled once, so the original folder never changes."""
 
-    def __init__(self, source: Path, workdir: Path) -> None:
-        """Set up the copy without making it yet."""
+    LISTENER = "lesstests.LesstestsProxyListener"
+
+    def __init__(self, source: Path, workdir: Path, overlays: tuple[Overlay, ...] = ()) -> None:
+        """Set up the copy without making it yet. The overlays go in after the copy, in order."""
         self.source = source
         self.workdir = workdir
+        self.overlays = overlays
+
+    @classmethod
+    def support_overlay(cls) -> Overlay:
+        """Place the TestNG listener that sends RestAssured through the intercepting proxy.
+
+        Returns:
+            The overlay.
+        """
+        package, name = cls.LISTENER.rsplit(".", 1)
+        source = Path(__file__).parent / "support" / f"{name}.java"
+        return Overlay(source, str(Path("src", "test", "java", *package.split("."), f"{name}.java")))
 
     def prepare(self) -> None:
-        """Copy the whole project without its build output, compile its tests and write the dependency classpath.
+        """Copy the whole project without its build output, apply the overlays, compile and write the classpath.
 
         Raises:
             ValueError: If the copy would sit inside the project, or the project inside the copy.
-            RuntimeError: If Maven fails.
+            CompileError: If Maven fails.
         """
         source, workdir = self.source.resolve(), self.workdir.resolve()
         if workdir.is_relative_to(source) or source.is_relative_to(workdir):
@@ -119,10 +225,12 @@ class MavenProject:
         if workdir.exists():
             shutil.rmtree(workdir)
         shutil.copytree(source, workdir, ignore=shutil.ignore_patterns("target", ".git"))
+        for overlay in self.overlays:
+            overlay.apply(self.workdir)
         command = ["mvn", "-q", "-B", "test-compile", "dependency:build-classpath", "-Dmdep.outputFile=classpath.txt"]
         result = subprocess.run(command, cwd=self.workdir, capture_output=True, text=True, errors="replace")
         if result.returncode != 0:
-            raise RuntimeError(f"Maven failed in {self.workdir}:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
+            raise CompileError(f"Maven failed in {self.workdir}:\n{result.stdout[-4000:]}{result.stderr[-4000:]}")
 
     @property
     def classpath(self) -> str:
@@ -130,6 +238,65 @@ class MavenProject:
         dependencies = (self.workdir / "classpath.txt").read_text(encoding="utf-8").strip()
         target = self.workdir / "target"
         return ":".join([str(target / "test-classes"), str(target / "classes"), dependencies])
+
+
+@dataclass(frozen=True, slots=True)
+class JvmSettings:
+    """Extra system properties, environment variables and TestNG listeners for a test JVM."""
+
+    SHORTEST_HIDDEN_VALUE: ClassVar[int] = 8
+    _BEARER_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[\w.~+/=-]{8,}")
+
+    properties: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    listeners: tuple[str, ...] = ()
+
+    def merged(self, other: "JvmSettings") -> "JvmSettings":
+        """Join two settings. The other one wins where both set the same name.
+
+        Returns:
+            The joined settings.
+        """
+        listeners = self.listeners + tuple(name for name in other.listeners if name not in self.listeners)
+        return JvmSettings({**self.properties, **other.properties}, {**self.env, **other.env}, listeners)
+
+    def java_arguments(self) -> list[str]:
+        """Turn the properties into `-D` flags, which go before the main class.
+
+        Returns:
+            The flags.
+        """
+        return [f"-D{key}={value}" for key, value in self.properties.items()]
+
+    def testng_arguments(self) -> list[str]:
+        """Name the listeners for TestNG, which go after the main class.
+
+        Returns:
+            The arguments, empty when there is no listener.
+        """
+        return ["-listener", ",".join(self.listeners)] if self.listeners else []
+
+    def environment(self) -> dict[str, str] | None:
+        """Build the child environment.
+
+        Returns:
+            This process's environment plus the extra variables, or None to inherit it unchanged.
+        """
+        return {**os.environ, **self.env} if self.env else None
+
+    def hide_secrets(self, text: str) -> str:
+        """Replace every bearer token and every env value of `SHORTEST_HIDDEN_VALUE` characters or more.
+
+        The env holds credentials. A client that logs its requests prints them, and also the access token it got
+        for them, which the env never held. A shorter env value would also wipe out ordinary words and numbers.
+
+        Returns:
+            The text with `<redacted>` in their place.
+        """
+        for value in sorted(self.env.values(), key=len, reverse=True):
+            if len(value) >= self.SHORTEST_HIDDEN_VALUE:
+                text = text.replace(value, "<redacted>")
+        return self._BEARER_TOKEN.sub(r"\1<redacted>", text)
 
 
 class Outcome(StrEnum):
@@ -149,17 +316,28 @@ class RunResult:
     seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class SuiteRun:
+    """The outcome of every test of one whole run in a single JVM, with the wall clock of that JVM."""
+
+    outcomes: dict[JavaTest, Outcome]
+    seconds: float
+
+
 class JvmRunner:
-    """Runs one TestNG test at a time in a fresh JVM, from the project folder so relative paths in tests resolve."""
+    """Runs TestNG tests in a fresh JVM, from the project folder so relative paths in tests resolve."""
 
     _STATUS = {"PASS": Outcome.PASSED, "FAIL": Outcome.FAILED, "SKIP": Outcome.SKIPPED}
     _WORST_FIRST = (Outcome.FAILED, Outcome.ERROR, Outcome.SKIPPED, Outcome.PASSED)
 
-    def __init__(self, project: MavenProject, output: Path, timeout: float = 300.0) -> None:
-        """Keep the project and the folder for TestNG's reports and console logs."""
+    def __init__(
+        self, project: MavenProject, output: Path, timeout: float = 300.0, settings: JvmSettings | None = None
+    ) -> None:
+        """Keep the project, the folder for TestNG's reports and console logs, and the JVM settings."""
         self._project = project
         self._output = output
         self._timeout = timeout
+        self._settings = settings or JvmSettings()
 
     def run(self, test: JavaTest) -> RunResult:
         """Run one test alone.
@@ -167,25 +345,108 @@ class JvmRunner:
         Returns:
             Its outcome. A test missing from TestNG's report, or a JVM that hangs, counts as an error.
         """
-        reports = self._output / test.id
-        if reports.exists():
-            shutil.rmtree(reports)
-        reports.mkdir(parents=True)
-        command = ["java", "-cp", self._project.classpath, "org.testng.TestNG", "-d", str(reports), "-methods", test.id]
+        reports = self._fresh(self._output / test.id)
         started = time.monotonic()
+        if not self._java(["-methods", test.id], reports, self._timeout):
+            return RunResult(Outcome.ERROR, time.monotonic() - started)
+        return RunResult(self._read_outcome(reports / "testng-results.xml", test), time.monotonic() - started)
+
+    def run_suite(self, tests: list[JavaTest], name: str, timeout: float = 1800.0) -> SuiteRun:
+        """Run all these tests together in one JVM, through a TestNG suite file that lists every method.
+
+        A suite file keeps the command line short, since a suite can list hundreds of methods.
+
+        Returns:
+            The outcome of every test and the times. Every test counts as an error when the JVM hangs.
+        """
+        reports = self._fresh(self._output / name)
+        suite_file = reports / "suite.xml"
+        suite_file.write_text(self.suite_xml(tests, name), encoding="utf-8")
+        started = time.monotonic()
+        finished = self._java([str(suite_file)], reports, timeout)
+        seconds = time.monotonic() - started
+        report = reports / "testng-results.xml"
+        if not finished:
+            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), seconds)
+        outcomes = {test: self._read_outcome(report, test) for test in tests}
+        return SuiteRun(outcomes, seconds)
+
+    @staticmethod
+    def suite_xml(tests: Iterable[JavaTest], name: str) -> str:
+        """Write a TestNG suite that runs exactly these methods, grouped by class in a stable order.
+
+        Returns:
+            The suite as XML text.
+        """
+        suite = ET.Element("suite", name=name)
+        block = ET.SubElement(suite, "test", {"name": name, "preserve-order": "true"})
+        classes = ET.SubElement(block, "classes")
+        by_class: dict[str, list[str]] = {}
+        for test in sorted(tests):
+            by_class.setdefault(test.class_name, []).append(test.method)
+        for class_name, methods in by_class.items():
+            methods_node = ET.SubElement(ET.SubElement(classes, "class", name=class_name), "methods")
+            for method in methods:
+                ET.SubElement(methods_node, "include", name=method)
+        doctype = '<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">'
+        return f'<?xml version="1.0" encoding="UTF-8"?>\n{doctype}\n{ET.tostring(suite, encoding="unicode")}\n'
+
+    def command(self, selection: list[str], reports: Path) -> list[str]:
+        """Build the java command line for a selection, either `-methods a.B.c` or a suite file.
+
+        Returns:
+            The command.
+        """
+        return [
+            "java",
+            *self._settings.java_arguments(),
+            "-cp",
+            self._project.classpath,
+            "org.testng.TestNG",
+            "-d",
+            str(reports),
+            *self._settings.testng_arguments(),
+            *selection,
+        ]
+
+    def _java(self, selection: list[str], reports: Path, timeout: float) -> bool:
+        """Run TestNG and keep its console output next to its reports.
+
+        Returns:
+            False when the JVM hung and was stopped.
+        """
         try:
             result = subprocess.run(
-                command,
+                self.command(selection, reports),
                 cwd=self._project.workdir,
                 capture_output=True,
                 text=True,
                 errors="replace",
-                timeout=self._timeout,
+                timeout=timeout,
+                env=self._settings.environment(),
             )
-            (reports / "console.log").write_text(result.stdout + result.stderr, encoding="utf-8")
         except subprocess.TimeoutExpired:
-            return RunResult(Outcome.ERROR, time.monotonic() - started)
-        return RunResult(self._read_outcome(reports / "testng-results.xml", test), time.monotonic() - started)
+            return False
+        console = self._settings.hide_secrets(result.stdout + result.stderr)
+        (reports / "console.log").write_text(console, encoding="utf-8")
+        return True
+
+    @staticmethod
+    def _fresh(folder: Path) -> Path:
+        if folder.exists():
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True)
+        return folder
+
+    @classmethod
+    def _methods(cls, report: Path, test: JavaTest) -> list[ET.Element]:
+        return [
+            method
+            for class_node in ET.parse(report).iter("class")
+            if class_node.get("name") == test.class_name
+            for method in class_node.iter("test-method")
+            if method.get("name") == test.method and method.get("is-config") != "true"
+        ]
 
     @classmethod
     def _read_outcome(cls, report: Path, test: JavaTest) -> Outcome:
@@ -196,11 +457,5 @@ class JvmRunner:
         """
         if not report.exists():
             return Outcome.ERROR
-        found = {
-            cls._STATUS.get(method.get("status", ""), Outcome.ERROR)
-            for class_node in ET.parse(report).iter("class")
-            if class_node.get("name") == test.class_name
-            for method in class_node.iter("test-method")
-            if method.get("name") == test.method and method.get("is-config") != "true"
-        }
+        found = {cls._STATUS.get(method.get("status", ""), Outcome.ERROR) for method in cls._methods(report, test)}
         return next((outcome for outcome in cls._WORST_FIRST if outcome in found), Outcome.ERROR)
