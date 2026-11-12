@@ -63,3 +63,13 @@ def test_without_merges_both_smaller_versions_are_the_same(tmp_path: Path) -> No
     plan = VersionPlanner(ApiDescription.load(spec), (coverage, originals)).plan()
     assert plan.versions[1].tests == plan.versions[2].tests
     assert len(plan.versions[1].tests) == 1
+
+
+def test_without_the_merge_step_the_plan_has_only_original_and_select(tmp_path: Path) -> None:
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps(SPEC))
+    originals = [_record("a", "/files"), _record("b", "/files")]
+    coverage = _coverage(originals, {"a": {"1"}, "b": {"1"}})
+    plan = VersionPlanner(ApiDescription.load(spec), (coverage, originals), merge_step=False).plan()
+    assert [version.name for version in plan.versions] == ["Original", "Select"]
+    assert len(plan.versions[1].tests) == 1

@@ -7,7 +7,7 @@ from typing import Any
 
 from lesstests.api import ApiDescription
 from lesstests.coverage import RestCov, SuiteCoverage
-from lesstests.java import JavaSuite, JavaTest, JvmRunner, MavenProject, Overlay
+from lesstests.java import BuiltProject, JavaTest, JvmRunner, Overlay
 from lesstests.merge import MergedTest, MergeOutcome, MergePlanner, Merger
 from lesstests.recording import RecordedTest, Recorder, Recording
 from lesstests.subjects import SUBJECTS, Subject
@@ -26,7 +26,7 @@ class MergeRoundRunner:
         self._env = env
         self._progress = progress
 
-    def project(self, edited: dict[Path, str], folder: Path) -> MavenProject:
+    def project(self, edited: dict[Path, str], folder: Path) -> BuiltProject:
         """Copy and compile the project with the edited test files on top of the subject's own overlays.
 
         Returns:
@@ -39,9 +39,9 @@ class MergeRoundRunner:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             overlays.append(Overlay(path, str(Path("src", "test", "java") / relative)))
-        maven = MavenProject(source, folder / "project", tuple(overlays))
-        maven.prepare()
-        return maven
+        built = self._subject.toolchain.project(source, folder / "project", tuple(overlays))
+        built.prepare()
+        return built
 
     def record(self, merged: list[MergedTest], edited: dict[Path, str], folder: Path) -> dict[JavaTest, RecordedTest]:
         """Record every merged test of one round alone.
@@ -50,12 +50,14 @@ class MergeRoundRunner:
             The record of each merged test.
         """
         print(f"Compiling round {folder.name} with {len(merged)} merged tests ...", flush=True)
-        maven = self.project(edited, folder)
+        built = self.project(edited, folder)
         connection = self._subject.connect(self._env)
         recording = Recording(folder / "recording")
-        runner = JvmRunner(maven, folder / "testng", settings=connection.settings)
-        suite = JavaSuite(maven.workdir, self._meta["package"])
-        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording)
+        timeouts = self._subject.timeouts
+        launcher = self._subject.toolchain.launcher()
+        runner = JvmRunner(built, folder / "testng", timeouts.test, connection.settings, launcher, timeouts.suite)
+        suite = self._subject.toolchain.suite(built, self._meta["package"], connection.settings)
+        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording, self._subject.reset_policy)
         recorder.run(self._meta, self._progress, [merge.test for merge in merged])
         return {record.test: record for record in recording.records()}
 
@@ -72,8 +74,12 @@ class MergeFolder:
 
     @property
     def project(self) -> Path:
-        """The compiled copy of the project with every kept merge. Every benchmark run starts from it."""
-        return self.folder / "project"
+        """The compiled copy every benchmark run starts from.
+
+        Merge compiles its own copy with every kept merge. `plan` reuses the recording's copy, and names it.
+        """
+        copy = self.meta().get("copy")
+        return Path(copy) if copy else self.folder / "project"
 
     def meta(self) -> dict[str, Any]:
         """Read the facts of the recording the merge started from.
@@ -91,10 +97,14 @@ class MergeFolder:
         """
         return VersionPlan.load(self.folder / "plan.json")
 
-    def save(self, meta: dict[str, Any], outcome: MergeOutcome, skipped: list[tuple[JavaTest, str]]) -> None:
-        """Write the facts and every merge tried, kept, or skipped with its reason."""
+    def save_meta(self, meta: dict[str, Any]) -> None:
+        """Write the facts."""
         self.folder.mkdir(parents=True, exist_ok=True)
         (self.folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    def save(self, meta: dict[str, Any], outcome: MergeOutcome, skipped: list[tuple[JavaTest, str]]) -> None:
+        """Write the facts and every merge tried, kept, or skipped with its reason."""
+        self.save_meta(meta)
         merges = {
             "accepted": [merge.to_dict() for merge in outcome.accepted],
             "attempts": outcome.attempts,
@@ -102,10 +112,11 @@ class MergeFolder:
         }
         (self.folder / "merges.json").write_text(json.dumps(merges, indent=1), encoding="utf-8")
 
-    def save_plan(self, plan: VersionPlan) -> None:
-        """Write the plan as JSON for the benchmark and as Markdown for a reader."""
+    def save_plan(self, plan: VersionPlan, note: str = "") -> None:
+        """Write the plan as JSON for the benchmark and as Markdown for a reader, with an optional note below."""
         plan.save(self.folder / "plan.json")
-        (self.folder / "plan.md").write_text(plan.markdown(), encoding="utf-8")
+        markdown = plan.markdown() + (f"\n{note}\n" if note else "")
+        (self.folder / "plan.md").write_text(markdown, encoding="utf-8")
 
 
 class MergeStudy:

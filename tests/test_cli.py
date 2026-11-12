@@ -7,9 +7,9 @@ from typing import Any
 import pytest
 from fake_restcov import FakeRestCov
 
-from lesstests import cli, merge_study
+from lesstests import cli, subjects
 from lesstests.exchange import Body, Exchange, Headers, HttpRequest, HttpResponse
-from lesstests.java import JavaTest, Outcome
+from lesstests.java import JavaTest, MavenProject, Outcome
 from lesstests.recording import RecordedTest, Recording
 
 
@@ -105,6 +105,8 @@ def test_coverage_without_restcov_stops_with_a_message(tmp_path: Path, monkeypat
 
 
 class FakeMaven:
+    support_overlay = staticmethod(MavenProject.support_overlay)
+
     def __init__(self, source: Path, workdir: Path, overlays: tuple[Any, ...] = ()) -> None:
         self.source = source
         self.workdir = workdir
@@ -117,19 +119,24 @@ class FakeMaven:
 class FakeRecorder:
     made: list["FakeRecorder"] = []
 
-    def __init__(self, suite: Any, runner: Any, service: Any, proxy: Any, recording: Recording) -> None:
+    def __init__(
+        self, suite: Any, runner: Any, service: Any, proxy: Any, recording: Recording, reset: Any = None
+    ) -> None:
         self.suite = suite
         self.service = service
         self.recording = recording
+        self.reset = reset
         self.meta: dict[str, Any] = {}
+        self.tests: list[Any] | None = None
         FakeRecorder.made.append(self)
 
-    def run(self, meta: dict[str, Any], progress: Any = None) -> None:
+    def run(self, meta: dict[str, Any], progress: Any = None, tests: list[Any] | None = None) -> None:
         self.meta = meta
+        self.tests = tests
 
 
 def test_record_wires_the_subject_and_suite_into_the_recorder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "MavenProject", FakeMaven)
+    monkeypatch.setattr(subjects, "MavenProject", FakeMaven)
     monkeypatch.setattr(cli, "Recorder", FakeRecorder)
     FakeRecorder.made.clear()
     out = tmp_path / "rec"
@@ -158,7 +165,7 @@ def test_env_file_reads_a_byte_order_mark_and_export_lines(tmp_path: Path) -> No
 
 
 def test_record_on_google_drive_stops_without_the_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "MavenProject", FakeMaven)
+    monkeypatch.setattr(subjects, "MavenProject", FakeMaven)
     monkeypatch.setattr(cli, "Recorder", FakeRecorder)
     args = ["record", "--subject", "google-drive", "--project", str(tmp_path / "drive"), "--suite", "single-agent"]
     with pytest.raises(ValueError, match="GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN"):
@@ -184,7 +191,7 @@ def _merge_ready_recording(tmp_path: Path) -> Recording:
 def test_merge_without_merges_still_compiles_the_project_and_plans_three_versions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
 ) -> None:
-    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    monkeypatch.setattr(subjects, "MavenProject", TrackedMaven)
     TrackedMaven.made.clear()
     recording = _merge_ready_recording(tmp_path)
     out = tmp_path / "merge"
@@ -239,6 +246,8 @@ class FakeRunner:
     output: Path
     timeout: float = 300.0
     settings: Any = None
+    launcher: Any = None
+    suite_timeout: float = 1800.0
 
 
 def test_bench_runs_the_merge_projects_copy_with_the_recordings_base_path(
@@ -274,7 +283,7 @@ def test_bench_runs_the_merge_projects_copy_with_the_recordings_base_path(
 def test_merge_stops_when_its_matching_differs_from_restcov(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
 ) -> None:
-    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    monkeypatch.setattr(subjects, "MavenProject", TrackedMaven)
     recording = _merge_ready_recording(tmp_path)
 
     # The tool matches GET /v2/a to an operation, but the fake RESTCov only ever reports path items.
@@ -287,7 +296,7 @@ def test_merge_stops_when_its_matching_differs_from_restcov(
 def test_merge_refuses_an_out_folder_inside_the_recording(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
 ) -> None:
-    monkeypatch.setattr(merge_study, "MavenProject", TrackedMaven)
+    monkeypatch.setattr(subjects, "MavenProject", TrackedMaven)
     recording = _merge_ready_recording(tmp_path)
     args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(recording.folder)]
     with pytest.raises(ValueError, match="sits inside the recording"):
@@ -298,3 +307,84 @@ def test_bench_needs_at_least_one_round(tmp_path: Path, capsys: pytest.CaptureFi
     with pytest.raises(SystemExit):
         cli.main(["bench", "--merge", str(tmp_path), "--rounds", "0"])
     assert "needs at least 1" in capsys.readouterr().err
+
+
+class FakeGradle(FakeMaven):
+    def __init__(
+        self,
+        source: Path,
+        workdir: Path,
+        module: str,
+        overlays: tuple[Any, ...] = (),
+        env: Any = None,
+        helpers: tuple[Path, ...] = (),
+    ) -> None:
+        super().__init__(source, workdir, overlays)
+        self.module = module
+        self.helpers = helpers
+
+
+class FakeJUnitSuite:
+    def __init__(self, project: Any, package: str, settings: Any = None) -> None:
+        self.project = project
+        self.package = package
+        self.settings = settings
+
+    def tests(self) -> list[JavaTest]:
+        prefix = "org.apache.fineract.integrationtests"
+        return [JavaTest(f"{prefix}.GroupTest", "a"), JavaTest(f"{prefix}.LoanTest", "b")]
+
+
+def test_record_on_fineract_uses_gradle_junit_and_a_per_class_reset_and_only_records_the_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(subjects, "GradleProject", FakeGradle)
+    monkeypatch.setattr(subjects, "JUnitSuite", FakeJUnitSuite)
+    monkeypatch.setattr(cli, "Recorder", FakeRecorder)
+    FakeRecorder.made.clear()
+    out = tmp_path / "rec"
+    args = ["record", "--subject", "fineract", "--project", str(tmp_path / "fineract"), "--suite", "integration-tests"]
+    cli.main([*args, "--out", str(out), "--only", r"\.GroupTest\."])
+
+    recorder = FakeRecorder.made[0]
+    assert recorder.suite.project.module == ":integration-tests"
+    assert [helper.name for helper in recorder.suite.project.helpers] == ["LesstestsJUnit.java"]
+    assert recorder.suite.settings.env["BACKEND_PORT"] == "8091"
+    assert recorder.service.address.port == 8092
+    assert recorder.reset.facts() == {"reset": "every class"}
+    assert recorder.tests is not None
+    assert [test.method for test in recorder.tests] == ["a"]
+    assert recorder.meta["only"] == r"\.GroupTest\."
+    assert recorder.meta["database_image"] == "postgres:18.3"
+
+    # The build makes the description, so it sits in the copy and not in the source.
+    assert recorder.meta["spec"] == str(out.resolve() / "project" / subjects.FINERACT.spec_file)
+
+
+def test_merge_refuses_a_suite_it_cannot_rewrite(tmp_path: Path) -> None:
+    recording = _recording(tmp_path / "rec")
+    recording.write_meta({"subject": "fineract", "spec": str(tmp_path / "spec.json")})
+    args = ["merge", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(tmp_path / "m")]
+    with pytest.raises(SystemExit, match="lesstests plan"):
+        cli.main(args)
+
+
+def test_plan_writes_original_and_select_and_points_bench_at_the_recordings_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restcov: tuple[FakeRestCov, list[tuple[Path, Path]]]
+) -> None:
+    recording = _merge_ready_recording(tmp_path)
+    out = tmp_path / "plan"
+    cli.main(["plan", "--recording", str(recording.folder), "--restcov", "restcov.py", "--out", str(out)])
+
+    versions = json.loads((out / "plan.json").read_text())["versions"]
+    assert [version["name"] for version in versions] == ["Original", "Select"]
+    assert "4 of 4 tests sent exactly one request." in (out / "plan.md").read_text()
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["copy"] == str(recording.folder.resolve() / "project")
+
+    monkeypatch.setattr(cli, "JvmRunner", FakeRunner)
+    monkeypatch.setattr(cli, "Benchmark", FakeBenchmark)
+    monkeypatch.setattr(cli, "BenchReport", FakeBenchReport)
+    FakeBenchmark.made.clear()
+    cli.main(["bench", "--plan", str(out), "--rounds", "3", "--restcov", "restcov.py"])
+    assert FakeBenchmark.made[0].runner.project.workdir == recording.folder.resolve() / "project"

@@ -110,10 +110,11 @@ class VersionPlan:
 
 
 class VersionPlanner:
-    """Builds the three versions with the smallest cover program.
+    """Builds the versions with the smallest cover program.
 
     Select keeps the fewest original tests that reach every item of the full suite. Select plus Merge may also pick
-    merged copies, which need fewer tests when one copy reaches the names of several originals.
+    merged copies, which need fewer tests when one copy reaches the names of several originals. Without the Merge
+    step there is no Select + Merge, since it would only run Select twice.
     """
 
     def __init__(
@@ -121,35 +122,37 @@ class VersionPlanner:
         api: ApiDescription,
         original: tuple[SuiteCoverage, list[RecordedTest]],
         merged: tuple[SuiteCoverage, list[RecordedTest]] | None = None,
+        merge_step: bool = True,
     ) -> None:
         """Keep the coverage and records of the original suite and of the accepted merged copies."""
         self._api = api
         self._original_coverage, self._original_records = original
         self._merged = merged
+        self._merge_step = merge_step
 
     def plan(self) -> VersionPlan:
         """Pick the tests of every version.
 
         Returns:
-            The plan with Original, Select and Select + Merge.
+            The plan with Original, Select and, after the Merge step, Select + Merge.
         """
         coverage = dict(self._original_coverage.per_test)
         records = {record.test: record for record in self._original_records}
         target = self._original_coverage.full
         original = sorted(records)
         select = SmallestCover().select(coverage, self._requests(records), target)
+        versions = [
+            self._version(VersionPlan.ORIGINAL, original, coverage, records),
+            self._version(VersionPlan.SELECT, select, coverage, records),
+        ]
+        if not self._merge_step:
+            return VersionPlan(versions)
         if self._merged is not None:
             merged_coverage, merged_records = self._merged
             coverage |= merged_coverage.per_test
             records |= {record.test: record for record in merged_records}
         select_merge = SmallestCover().select(coverage, self._requests(records), target)
-        return VersionPlan(
-            [
-                self._version(VersionPlan.ORIGINAL, original, coverage, records),
-                self._version(VersionPlan.SELECT, select, coverage, records),
-                self._version(VersionPlan.SELECT_MERGE, select_merge, coverage, records),
-            ]
-        )
+        return VersionPlan([*versions, self._version(VersionPlan.SELECT_MERGE, select_merge, coverage, records)])
 
     @staticmethod
     def _requests(records: dict[JavaTest, RecordedTest]) -> dict[JavaTest, int]:

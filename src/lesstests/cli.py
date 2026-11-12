@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Protocol
@@ -7,12 +8,13 @@ from typing import Any, Protocol
 from lesstests.api import ApiDescription
 from lesstests.bench import Benchmark, BenchReport, BenchRun
 from lesstests.coverage import RestCov, SuiteCoverage
-from lesstests.java import JavaSuite, JvmRunner, MavenProject
+from lesstests.java import BuiltProject, JvmRunner, JvmSettings
 from lesstests.merge_study import MergeFolder, MergeStudy
 from lesstests.recording import RecordedTest, Recorder, Recording
 from lesstests.selection import Budget
 from lesstests.study import SelectionStudy
-from lesstests.subjects import SUBJECTS, SuiteCatalog
+from lesstests.subjects import SUBJECTS, Subject, SuiteCatalog
+from lesstests.versions import VersionPlanner
 
 
 class Command(Protocol):
@@ -112,9 +114,10 @@ class RecordCommand:
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Declare the project, suite and output folder."""
         parser.add_argument("--subject", default="petstore", choices=sorted(SUBJECTS))
-        parser.add_argument("--project", type=Path, required=True, help="the Maven project of the subject")
+        parser.add_argument("--project", type=Path, required=True, help="the Maven or Gradle project of the subject")
         parser.add_argument("--suite", required=True, help="suite name, like single-agent or multi-agent")
         parser.add_argument("--out", type=Path, required=True, help="the recording folder")
+        parser.add_argument("--only", help="record only the tests whose id matches this regular expression")
         EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
@@ -122,23 +125,44 @@ class RecordCommand:
         subject = SUBJECTS[args.subject]
         project = args.project.resolve()
         recording = Recording(args.out.resolve())
-        maven = MavenProject(project, recording.folder / "project", subject.overlays(project, args.suite))
+        built = subject.toolchain.project(project, recording.folder / "project", subject.overlays(project, args.suite))
         print(f"Compiling a copy of {project} ...", flush=True)
-        maven.prepare()
-        suite = JavaSuite(maven.workdir, SuiteCatalog.source(subject, args.suite).package)
+        built.prepare()
         connection = subject.connect(EnvFile.read(args.env_file))
-        runner = JvmRunner(maven, recording.folder / "testng", settings=connection.settings)
-        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording)
+        package = SuiteCatalog.source(subject, args.suite).package
+        suite = subject.toolchain.suite(built, package, connection.settings)
+        runner = Runners.of(subject, built, recording.folder / "testng", connection.settings)
+        recorder = Recorder(suite, runner, connection.service, connection.proxy, recording, subject.reset_policy)
         meta = {
             "subject": subject.name,
             "suite": args.suite,
-            "package": suite.package,
+            "package": package,
             "project": str(project),
-            "spec": str(project / subject.spec_file),
+            "spec": str(subject.spec_path(project, built.workdir)),
             "restcov_base_path": subject.restcov_base_path,
             **subject.meta(),
         }
-        recorder.run(meta, Progress.recorded)
+        tests = None
+        if args.only is not None:
+            pattern = re.compile(args.only)
+            tests = [test for test in suite.tests() if pattern.search(test.id)]
+            meta["only"] = args.only
+        recorder.run(meta, Progress.recorded, tests)
+
+
+class Runners:
+    """Builds the test runner a subject needs, with its framework and its timeouts."""
+
+    @staticmethod
+    def of(subject: Subject, project: BuiltProject, output: Path, settings: JvmSettings) -> JvmRunner:
+        """Build the runner.
+
+        Returns:
+            The runner.
+        """
+        timeouts = subject.timeouts
+        launcher = subject.toolchain.launcher()
+        return JvmRunner(project, output, timeouts.test, settings, launcher, timeouts.suite)
 
 
 class RecordingCommand:
@@ -219,12 +243,45 @@ class MergeCommand(RecordingCommand):
         EnvFile.add_argument(parser)
 
     def run(self, args: argparse.Namespace) -> None:
-        """Run the Merge step and print the plan."""
+        """Run the Merge step and print the plan.
+
+        Raises:
+            SystemExit: If the subject's tests are not ones Merge can rewrite.
+        """
         recording = Recording(args.recording.resolve())
+        if not SUBJECTS[recording.meta()["subject"]].toolchain.mergeable:
+            raise SystemExit("Merge only rewrites TestNG suites. Use `lesstests plan` for Original and Select")
         restcov = RestCovOption.restcov(args, recording.meta())
         coverage = self.coverage(recording, restcov)
         study = MergeStudy(recording, restcov, coverage, EnvFile.read(args.env_file), args.rounds, Progress.recorded)
         print(study.run(args.out.resolve()).markdown())
+
+
+class PlanCommand(RecordingCommand):
+    """Plans Original and Select without the Merge step, for a suite Merge can't rewrite."""
+
+    name = "plan"
+    help = "plan the Original and Select versions for the benchmark, without Merge"
+
+    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+        """Declare the recording, RESTCov and the output folder."""
+        super().add_arguments(parser)
+        parser.add_argument("--out", type=Path, required=True, help="the plan folder that `bench --plan` reads")
+
+    def run(self, args: argparse.Namespace) -> None:
+        """Pick Select's tests and write the folder the benchmark reads."""
+        recording = Recording(args.recording.resolve())
+        meta = recording.meta()
+        restcov = RestCovOption.restcov(args, meta)
+        coverage = self.coverage(recording, restcov)
+        api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
+        records = recording.records()
+        plan = VersionPlanner(api, (coverage, records), merge_step=False).plan()
+        folder = MergeFolder(args.out.resolve())
+        folder.save_meta({**meta, "recording": str(recording.folder), "copy": str(recording.folder / "project")})
+        single = sum(record.requests == 1 for record in records)
+        folder.save_plan(plan, f"{single} of {len(records)} tests sent exactly one request.")
+        print((folder.folder / "plan.md").read_text(encoding="utf-8"))
 
 
 class BenchCommand:
@@ -235,7 +292,9 @@ class BenchCommand:
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Declare the merge folder, the rounds, RESTCov and the credentials."""
-        parser.add_argument("--merge", type=Path, required=True, help="a folder made by `lesstests merge`")
+        parser.add_argument(
+            "--plan", "--merge", dest="plan", type=Path, required=True, help="a folder made by `merge` or `plan`"
+        )
         parser.add_argument("--rounds", type=self.at_least_one, default=10)
         parser.add_argument("--warmup", type=int, default=1, help="Original runs before the counted rounds")
         parser.add_argument("--out", type=Path, help="the benchmark folder, by default `bench` in the merge folder")
@@ -259,15 +318,17 @@ class BenchCommand:
 
     def run(self, args: argparse.Namespace) -> None:
         """Run the benchmark and print the report."""
-        folder = MergeFolder(args.merge.resolve())
+        folder = MergeFolder(args.plan.resolve())
         out = (args.out or folder.folder / "bench").resolve()
         meta = folder.meta()
         restcov = RestCovOption.restcov(args, meta)
         api = ApiDescription.load(Path(meta["spec"]), meta.get("restcov_base_path"))
-        connection = SUBJECTS[meta["subject"]].connect(EnvFile.read(args.env_file))
+        subject = SUBJECTS[meta["subject"]]
+        connection = subject.connect(EnvFile.read(args.env_file))
 
-        # The merge step already compiled this copy, and every version runs from it.
-        runner = JvmRunner(MavenProject(Path(meta["project"]), folder.project), out, settings=connection.settings)
+        # Merge or Record already compiled this copy, and every version runs from it.
+        project = subject.toolchain.project(Path(meta["project"]), folder.project, ())
+        runner = Runners.of(subject, project, out, connection.settings)
         plan = folder.plan()
         benchmark = Benchmark(plan, runner, connection.proxy, connection.proxy.log, connection.service, (restcov, api))
         runs = benchmark.run(out, args.rounds, args.warmup, Progress.benched)
@@ -281,6 +342,7 @@ COMMANDS: tuple[Command, ...] = (
     CoverageCommand(),
     SelectCommand(),
     MergeCommand(),
+    PlanCommand(),
     BenchCommand(),
 )
 

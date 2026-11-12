@@ -147,3 +147,42 @@ def test_a_folder_with_runs_of_another_plan_is_refused(tmp_path: Path) -> None:
     stale = Benchmark(other, FakeRunner(log), contextlib.nullcontext(), log, FakeService(), measure)
     with pytest.raises(ValueError, match="holds runs of another plan"):
         stale.run(tmp_path / "bench", rounds=1, warmup=0)
+
+
+def test_a_plan_without_select_merge_only_compares_select_with_the_original(tmp_path: Path) -> None:
+    benchmark, _, _ = _bench(tmp_path)
+    two = VersionPlan(_plan().versions[:2])
+    benchmark._plan = two
+    runs = benchmark.run(tmp_path / "bench", rounds=5, warmup=0)
+    report = BenchReport(two, runs).markdown()
+    assert "Select against Original: faster in 5 of 5 rounds" in report
+    assert "Select + Merge" not in report
+
+
+class TimeoutRunner(FakeRunner):
+    """The full suite sends its requests but hits the suite timeout the first time."""
+
+    def __init__(self, log: FakeLog) -> None:
+        super().__init__(log)
+        self.timed_out = False
+
+    def run_suite(self, tests: list[JavaTest], name: str) -> SuiteRun:
+        run = super().run_suite(tests, name)
+        if len(tests) == 4 and not self.timed_out:
+            self.timed_out = True
+            return SuiteRun(dict.fromkeys(tests, Outcome.ERROR), 7200.0, finished=False)
+        return run
+
+
+def test_a_run_that_hit_the_suite_timeout_is_repeated_instead_of_counted(tmp_path: Path) -> None:
+    benchmark, _, _ = _bench(tmp_path)
+    slow = TimeoutRunner(FakeLog())
+    benchmark._runner = slow
+    benchmark._log = slow.log
+    runs = benchmark.run(tmp_path / "bench", rounds=1, warmup=0)
+
+    # It sent 4 requests, which used to make it look like a run that started.
+    assert all(run.started and run.finished for run in runs)
+    assert Benchmark.repeated(tmp_path / "bench") == 1
+    failed = json.loads(next((tmp_path / "bench" / "runs" / "failed").glob("*.json")).read_text())
+    assert (failed["requests"], failed["finished"]) == (4, False)
